@@ -1,0 +1,43 @@
+name: Windows release check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  release-check:
+    runs-on: windows-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: rustup show
+
+      - name: Fetch locked application dependencies
+        shell: pwsh
+        run: cargo fetch --locked --target x86_64-pc-windows-msvc
+
+      - name: Fetch locked repak test dependencies
+        shell: pwsh
+        run: cargo fetch --manifest-path vendor/repak/Cargo.toml --locked --target x86_64-pc-windows-msvc
+
+      - name: Run release checks and build package
+        shell: pwsh
+        run: ./scripts/build-release.ps1
+
+      - name: Upload checked Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Pak-Merger-windows-x64
+          path: dist/Pak-Merger-windows-x64/
+          if-no-files-found: error
+          retention-days: 14

@@ -1,0 +1,38 @@
+# Rust and release outputs
+/target/
+/build/
+/dist/
+/vendor/repak/target/
+
+# Pak Merger temporary and generated files
+*.partial
+*.pak
+*.utoc
+*.ucas
+*.sig
+*.key
+*.zip
+*.exe
+*.dll
+*.pdb
+*.lib
+*.exp
+*.tmp
+*.bak
+*.log
+*.dmp
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.idea/
+.vscode/
+*.user
+*.suo
+Thumbs.db
+.DS_Store
+
+# Python helper caches
+__pycache__/
+*.py[cod]

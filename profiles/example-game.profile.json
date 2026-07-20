@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "example_game",
+  "displayName": "Example Game",
+  "format": "messagepack_m_data_list_v1",
+  "detection": {
+    "minimumMatches": 1,
+    "pathMatchers": [
+      {
+        "kind": "contains",
+        "value": "/examplegame/content/database/"
+      }
+    ]
+  },
+  "assets": [
+    {
+      "id": "skills",
+      "pathMatchers": [
+        {
+          "kind": "suffix",
+          "value": "/examplegame/content/database/skills"
+        }
+      ],
+      "fieldGroups": [
+        {
+          "id": "damage_slots",
+          "fields": [
+            "m_Types",
+            "m_Values"
+          ],
+          "mode": "parallel_array_items"
+        }
+      ]
+    }
+  ]
+}

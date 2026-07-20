@@ -1,0 +1,32 @@
+Pak Merger Non-Commercial Source License 1.0
+
+Copyright (c) 2026 Pak Merger contributors. All rights reserved.
+
+1. Permission
+
+Permission is granted to view, use, copy, modify, and redistribute this software and its source code solely for personal, non-commercial purposes, subject to this license and the Pak Merger Terms of Use.
+
+2. Conditions
+
+Any redistribution of the software or a modified version must:
+
+- retain this license, the Pak Merger Terms of Use, and all third-party notices;
+- clearly identify material modifications;
+- remain limited to personal, non-commercial use; and
+- include only material the distributor has the right to distribute.
+
+3. Prohibited use
+
+The software and source code may not be sold, licensed for a fee, used in a paid service, or otherwise exploited commercially. They may not be used to bypass technical protection measures or for unlawful activity.
+
+4. Other terms
+
+This license covers Pak Merger only. Third-party components remain under their own licenses. Users and distributors are responsible for complying with applicable software terms, permissions, and law. See `THIRD_PARTY_NOTICES.md` and `licenses/` for third-party information.
+
+5. No warranty and limitation of liability
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, NON-INFRINGEMENT, COMPATIBILITY, OR DATA PRESERVATION. TO THE MAXIMUM EXTENT PERMITTED BY APPLICABLE LAW, THE AUTHORS AND CONTRIBUTORS SHALL NOT BE LIABLE FOR ANY CLAIM, DAMAGE, DATA LOSS, GAME OR SAVE FAILURE, OR OTHER LIABILITY ARISING FROM THE SOFTWARE OR ITS USE.
+
+6. Termination
+
+The permissions granted by this license terminate automatically upon a breach of its terms. Rights under applicable third-party licenses are unaffected.

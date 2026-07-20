@@ -1,0 +1,15 @@
+<!--
+  Pak Merger application icon.
+  The merge-arrow paths are adapted from Tabler Icons "arrows-join",
+  licensed under the MIT License. See README.md and
+  ../../licenses/tabler-icons-MIT.txt.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 24 24">
+  <rect x="0.75" y="0.75" width="22.5" height="22.5" rx="5.25" fill="#08090b"/>
+  <rect x="1.25" y="1.25" width="21.5" height="21.5" rx="4.75" fill="none" stroke="#30343a" stroke-width="1"/>
+  <g fill="none" stroke="#f7f7f7" stroke-width="2.25" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M3 7h5l3.5 5h9.5"/>
+    <path d="M3 17h5l3.495 -5"/>
+    <path d="M18 15l3 -3l-3 -3"/>
+  </g>
+</svg>

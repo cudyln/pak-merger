@@ -1,0 +1,58 @@
+[package]
+name = "pak-merger"
+version = "1.0.0"
+edition = "2024"
+rust-version = "1.97.1"
+publish = false
+default-run = "pak-merger"
+description = "Merge compatible Unreal Pak mods and resolve conflicting data"
+license-file = "LICENSE"
+
+[lib]
+name = "pak_merger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "pak-merger"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive"] }
+eframe = { version = "0.32", default-features = false, features = ["default_fonts", "glow"] }
+fs2 = "0.4"
+hex = "0.4"
+memmap2 = "0.9"
+lz4_flex = "0.12.0"
+oodle_loader = { path = "vendor/repak/oodle_loader" }
+repak = { path = "vendor/repak/repak", default-features = false, features = ["compression", "oodle"] }
+rfd = "0.15"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sha1 = "0.10"
+sys-locale = "0.3"
+tempfile = "3.20"
+thiserror = "2.0"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+
+[dev-dependencies]
+proptest = "1.7"
+
+[target.'cfg(windows)'.build-dependencies]
+winres = "0.1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+incremental = false
+debug = 0
+
+[package.metadata.pak-merger]
+repak_upstream_revision = "e215472c51db69328b1ce77be2db24d24c1d646b"
+repak_vendor_patch = "performance-and-streaming-v1"
