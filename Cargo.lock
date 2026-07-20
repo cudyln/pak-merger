@@ -2036,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "pak-merger"
-version = "1.0.0"
+version = "1.0.0-r1"
 dependencies = [
  "anyhow",
  "clap",
