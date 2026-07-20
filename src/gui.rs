@@ -11,6 +11,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 
 const DEFAULT_MERGED_PAK_FILE_NAME: &str = "ZZMerge_P.pak";
+const GITHUB_REPOSITORY_URL: &str = "https://github.com/cudyln/pak-merger";
 
 enum WorkerResult {
     Analyzed(Box<pak_merger::merge::MergeAnalysisSession>),
@@ -274,6 +275,10 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         "No items match this search." => "検索条件に一致する項目はありません。",
         "Oodle compression" => "Oodle 圧縮",
         "Options" => "オプション",
+        "About" => "情報",
+        "About Pak Merger" => "Pak Merger について",
+        "Close" => "閉じる",
+        "GitHub repository" => "GitHub リポジトリ",
         "Pak ID" => "Pak ID",
         "Terms of Use" => "利用規約",
         "Pak storage method" => "Pak の保存方式",
@@ -328,6 +333,7 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         }
         "Stored-data check" => "保存データ検査値",
         "Terms" => "利用規約",
+        "Version" => "バージョン",
         "The base Pak changed, so the previous analysis and choices were cleared. Analyze again." => {
             "基準 Pak が変更されたため、以前の解析結果と選択を消去しました。もう一度解析してください。"
         }
@@ -429,6 +435,8 @@ struct MergerApp {
     consent_valid: bool,
     eula_confirmations: EulaConfirmations,
     show_terms: bool,
+    show_about: bool,
+    about_icon: Option<egui::TextureHandle>,
     pak_paths: Vec<PathBuf>,
     carrier_index: usize,
     plan: Option<Arc<MergePlan>>,
@@ -466,6 +474,8 @@ impl Default for MergerApp {
             consent_valid: eula::has_valid_consent(),
             eula_confirmations: EulaConfirmations::default(),
             show_terms: false,
+            show_about: false,
+            about_icon: None,
             pak_paths: Vec::new(),
             carrier_index: 0,
             plan: None,
@@ -499,6 +509,24 @@ impl Default for MergerApp {
 impl MergerApp {
     fn tr<'a>(&self, ko: &'a str, en: &'a str) -> &'a str {
         self.locale.tr(ko, en)
+    }
+
+    fn about_icon(&mut self, context: &egui::Context) -> Option<egui::TextureHandle> {
+        if self.about_icon.is_none() {
+            let icon =
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon/app-icon.png"))
+                    .ok()?;
+            let image = egui::ColorImage::from_rgba_unmultiplied(
+                [icon.width as usize, icon.height as usize],
+                &icon.rgba,
+            );
+            self.about_icon = Some(context.load_texture(
+                "pak-merger-about-icon",
+                image,
+                egui::TextureOptions::LINEAR,
+            ));
+        }
+        self.about_icon.clone()
     }
 
     fn progress_stage_label(&self, stage: MergeProgressStage) -> &'static str {
@@ -1540,9 +1568,13 @@ impl eframe::App for MergerApp {
             ));
             let merge_tab = self.tr("병합", "Merge").to_owned();
             let options_tab = self.tr("옵션", "Options").to_owned();
+            let about_button = self.tr("정보", "About").to_owned();
             ui.horizontal(|ui| {
                 ui.selectable_value(&mut self.show_options, false, merge_tab);
                 ui.selectable_value(&mut self.show_options, true, options_tab);
+                if ui.button(about_button).clicked() {
+                    self.show_about = true;
+                }
             });
         });
 
@@ -2096,6 +2128,47 @@ impl eframe::App for MergerApp {
                 });
             });
             self.show_terms = show_terms;
+        }
+
+        if self.show_about {
+            let locale = self.locale;
+            let icon = self.about_icon(context);
+            let mut show_about = self.show_about;
+            let mut close_requested = false;
+            egui::Window::new(locale.tr("Pak Merger 정보", "About Pak Merger"))
+                .id(egui::Id::new("about-pak-merger"))
+                .open(&mut show_about)
+                .collapsible(false)
+                .resizable(false)
+                .default_width(380.0)
+                .show(context, |ui| {
+                    ui.vertical_centered(|ui| {
+                        if let Some(icon) = icon.as_ref() {
+                            ui.image((icon.id(), egui::vec2(96.0, 96.0)));
+                            ui.add_space(8.0);
+                        }
+                        ui.heading(PRODUCT_NAME);
+                        ui.label(format!(
+                            "{} {}",
+                            locale.tr("버전", "Version"),
+                            env!("CARGO_PKG_VERSION")
+                        ));
+                        ui.add_space(12.0);
+                        ui.hyperlink_to(
+                            locale.tr("GitHub 저장소", "GitHub repository"),
+                            GITHUB_REPOSITORY_URL,
+                        );
+                        ui.small(GITHUB_REPOSITORY_URL);
+                        ui.add_space(16.0);
+                        if ui.button(locale.tr("닫기", "Close")).clicked() {
+                            close_requested = true;
+                        }
+                    });
+                });
+            if close_requested {
+                show_about = false;
+            }
+            self.show_about = show_about;
         }
 
         if let Some(path) = self.pending_overwrite.clone() {
@@ -3186,6 +3259,17 @@ mod tests {
     fn japanese_locale_covers_primary_ui_and_error_copy() {
         assert_eq!(UiLocale::Japanese.tr("병합", "Merge"), "統合");
         assert_eq!(UiLocale::Japanese.tr("옵션", "Options"), "オプション");
+        assert_eq!(UiLocale::Japanese.tr("정보", "About"), "情報");
+        assert_eq!(
+            UiLocale::Japanese.tr("Pak Merger 정보", "About Pak Merger"),
+            "Pak Merger について"
+        );
+        assert_eq!(UiLocale::Japanese.tr("버전", "Version"), "バージョン");
+        assert_eq!(
+            UiLocale::Japanese.tr("GitHub 저장소", "GitHub repository"),
+            "GitHub リポジトリ"
+        );
+        assert_eq!(UiLocale::Japanese.tr("닫기", "Close"), "閉じる");
         assert_eq!(
             UiLocale::Japanese.tr("이용약관", "Terms of Use"),
             "利用規約"
@@ -3256,6 +3340,16 @@ mod tests {
     #[test]
     fn gui_output_name_defaults_to_late_loading_pak_name() {
         assert_eq!(DEFAULT_MERGED_PAK_FILE_NAME, "ZZMerge_P.pak");
+    }
+
+    #[test]
+    fn about_dialog_uses_release_identity_and_project_link() {
+        assert_eq!(PRODUCT_NAME, "Pak Merger");
+        assert!(!env!("CARGO_PKG_VERSION").is_empty());
+        assert_eq!(
+            GITHUB_REPOSITORY_URL,
+            "https://github.com/cudyln/pak-merger"
+        );
     }
 
     #[test]
