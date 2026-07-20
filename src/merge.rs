@@ -8505,14 +8505,13 @@ mod tests {
                 .as_deref()
                 .is_some_and(|item| item.contains(base) && item.contains("m_id 1"))
         }));
-        assert_eq!(
-            progress_events.last(),
-            Some(&MergeProgress {
-                stage: MergeProgressStage::Finalizing,
-                completed: 1,
-                total: 1,
-                current_item: None,
-            })
+        let final_progress = progress_events.last().unwrap();
+        assert_eq!(final_progress.stage, MergeProgressStage::Finalizing);
+        assert_eq!(final_progress.completed, final_progress.total);
+        assert_eq!(final_progress.current_item, None);
+        assert!(
+            final_progress.total == 1 || final_progress.total == report.output_size.max(1),
+            "final progress must represent either an atomic install or a cross-volume byte copy"
         );
         assert!(report.verification_passed);
         assert_eq!(report.raw_preserved_nodes, 1);
