@@ -1,6 +1,6 @@
 [package]
 name = "pak-merger"
-version = "1.0.1"
+version = "1.0.1-r1"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
