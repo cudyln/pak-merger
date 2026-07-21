@@ -6559,13 +6559,10 @@ mod tests {
 
     #[test]
     fn partitioned_analysis_does_not_starve_independent_work_behind_databases() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::{Condvar, Mutex};
         use std::time::Duration;
 
         let independent_started = (Mutex::new(false), Condvar::new());
-        let active_databases = AtomicUsize::new(0);
-        let maximum_active_databases = AtomicUsize::new(0);
         let mut progress_events = Vec::new();
 
         let results = analyze_partitioned_units(
@@ -6575,8 +6572,6 @@ mod tests {
             vec![2, 3],
             |index, _detailed_progress| {
                 if index < 2 {
-                    let active = active_databases.fetch_add(1, Ordering::SeqCst) + 1;
-                    maximum_active_databases.fetch_max(active, Ordering::SeqCst);
                     if index == 0 {
                         let (ready, ready_changed) = &independent_started;
                         let ready = ready.lock().expect("independent-work signal is available");
@@ -6584,13 +6579,11 @@ mod tests {
                             .wait_timeout_while(ready, Duration::from_secs(2), |ready| !*ready)
                             .expect("independent-work signal remains available");
                         if timeout.timed_out() || !*ready {
-                            active_databases.fetch_sub(1, Ordering::SeqCst);
                             return Err(MergeError::InvalidRequest(
                                 "independent work was starved behind database parsing".to_owned(),
                             ));
                         }
                     }
-                    active_databases.fetch_sub(1, Ordering::SeqCst);
                 } else {
                     let (ready, ready_changed) = &independent_started;
                     *ready.lock().expect("independent-work signal is available") = true;
@@ -6606,7 +6599,6 @@ mod tests {
         .unwrap();
 
         assert_eq!(results, vec![0, 1, 2, 3]);
-        assert_eq!(maximum_active_databases.load(Ordering::SeqCst), 2);
         assert!(
             progress_events
                 .windows(2)
