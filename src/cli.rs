@@ -3,15 +3,19 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use pak_merger::eula::{
     self, EULA_EN, EULA_JA, EULA_KO, EULA_VERSION, EulaConfirmations, EulaLocale, PRODUCT_NAME,
 };
+use pak_merger::pak::PakArchive;
 use pak_merger::report;
 use pak_merger::{
-    AnalysisRequest, OutputCompression, PakInput, ResolutionSet, WriteOptions, analyze, inspect,
-    resolve, verify, write_with_options,
+    AnalysisRequest, CancellationToken, MergeAnalysisSession, OutputCompression, PakInput,
+    ResolutionSet, WriteOptions, analyze_with_archives_progress_cancel_and_threads, inspect,
+    resolve, verify, write_session_with_options_progress_and_cancel,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -35,7 +39,7 @@ enum Command {
     Analyze(AnalyzeArgs),
     /// Apply saved choices and write one merged Pak.
     Merge(MergeArgs),
-    /// Check a Pak and print the verification result.
+    /// Check a Pak's structural integrity. This does not compare against a saved merge report.
     Verify(VerifyArgs),
 }
 
@@ -181,17 +185,32 @@ struct EulaStatus<'a> {
 
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
-    if !matches!(&cli.command, Command::Eula(_)) {
-        require_current_eula_consent()?;
-    }
-
     match cli.command {
         Command::Eula(args) => run_eula(args),
-        Command::Inspect(args) => run_inspect(args),
-        Command::Analyze(args) => run_analyze(args),
-        Command::Merge(args) => run_merge(args),
-        Command::Verify(args) => run_verify(args),
+        Command::Analyze(args) => {
+            require_current_eula_consent()?;
+            let cancellation = cli_cancellation_token()?;
+            run_analyze(args, &cancellation)
+        }
+        Command::Merge(args) => {
+            require_current_eula_consent()?;
+            let cancellation = cli_cancellation_token()?;
+            run_merge(args, &cancellation)
+        }
+        Command::Inspect(args) => {
+            require_current_eula_consent()?;
+            run_inspect(args)
+        }
+        Command::Verify(args) => {
+            require_current_eula_consent()?;
+            run_verify(args)
+        }
     }
+}
+
+fn cli_cancellation_token() -> Result<CancellationToken> {
+    pak_merger::control::install_console_cancellation_handler()
+        .context("could not install the Ctrl+C cancellation handler")
 }
 
 fn run_eula(args: EulaArgs) -> Result<()> {
@@ -301,17 +320,15 @@ fn run_inspect(args: InspectArgs) -> Result<()> {
     emit_json(args.output.as_deref(), &inventory)
 }
 
-fn run_analyze(args: AnalyzeArgs) -> Result<()> {
+fn run_analyze(args: AnalyzeArgs, cancellation: &CancellationToken) -> Result<()> {
     let base_pak = args
         .base_pak
         .or_else(|| args.pak_paths.first().cloned())
         .context("at least one --pak input is required")?;
-    let plan = analyze(AnalysisRequest {
-        pak_paths: args.pak_paths,
-        carrier_path: base_pak,
-    })
-    .context("Pak comparison failed")?;
-    write_json_new(&args.output, &plan)?;
+    let request = canonicalize_analysis_request(args.pak_paths, base_pak)?;
+    let session = open_analysis_session(request, cancellation).context("Pak comparison failed")?;
+    let plan = session.plan();
+    write_json_new(&args.output, plan)?;
     println!("Comparison saved: {}", args.output.display());
     println!(
         "Choices required: {}",
@@ -320,7 +337,50 @@ fn run_analyze(args: AnalyzeArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_merge(args: MergeArgs) -> Result<()> {
+fn canonicalize_analysis_request(
+    pak_paths: Vec<PathBuf>,
+    carrier_path: PathBuf,
+) -> Result<AnalysisRequest> {
+    let pak_paths = pak_paths
+        .into_iter()
+        .map(canonicalize_pak_input)
+        .collect::<Result<Vec<_>>>()?;
+    let carrier_path = canonicalize_pak_input(carrier_path)?;
+    Ok(AnalysisRequest {
+        pak_paths,
+        carrier_path,
+    })
+}
+
+fn canonicalize_pak_input(path: PathBuf) -> Result<PathBuf> {
+    fs::canonicalize(&path)
+        .with_context(|| format!("couldn't resolve the Pak input: {}", path.display()))
+}
+
+fn open_analysis_session(
+    request: AnalysisRequest,
+    cancellation: &CancellationToken,
+) -> Result<MergeAnalysisSession> {
+    let archives = request
+        .pak_paths
+        .iter()
+        .map(|path| {
+            PakArchive::open_fast_with_progress_cancel_and_threads(path, cancellation, true, |_| {})
+                .map(Arc::new)
+                .with_context(|| format!("couldn't read the Pak input: {}", path.display()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    analyze_with_archives_progress_cancel_and_threads(
+        request,
+        archives,
+        cancellation,
+        true,
+        |_, _, _| {},
+    )
+    .map_err(Into::into)
+}
+
+fn run_merge(args: MergeArgs, cancellation: &CancellationToken) -> Result<()> {
     let plan = report::read_plan(&args.plan)
         .with_context(|| format!("couldn't open the comparison file: {}", args.plan.display()))?;
     let mut resolutions = match args.resolutions {
@@ -332,15 +392,24 @@ fn run_merge(args: MergeArgs) -> Result<()> {
         },
     };
     merge_inline_choices(&mut resolutions, &args.choices)?;
-    let resolved = resolve(plan, resolutions).context("some conflicts still need a choice")?;
-    let report = write_with_options(
-        resolved,
+    let resolved =
+        resolve(plan.clone(), resolutions).context("some conflicts still need a choice")?;
+    let session = open_analysis_session(plan.request.clone(), cancellation)
+        .context("the Pak inputs could not be checked again")?;
+    if session.plan().plan_id != plan.plan_id {
+        bail!("one or more Pak inputs changed after the comparison was saved; analyze them again");
+    }
+    let report = write_session_with_options_progress_and_cancel(
+        &session,
+        resolved.resolutions,
         &args.output,
         WriteOptions {
             compression: args.compression.into(),
             multithreaded: true,
             overwrite_existing: args.overwrite,
         },
+        cancellation,
+        |_| {},
     )
     .context("merged Pak creation failed")?;
     println!("Merged Pak: {}", args.output.display());
@@ -354,10 +423,18 @@ fn run_merge(args: MergeArgs) -> Result<()> {
             "Uncompressed"
         }
     );
+    for warning in report
+        .warnings
+        .iter()
+        .chain(report.reference_validation_warnings.iter())
+    {
+        eprintln!("Warning: {warning}");
+    }
     Ok(())
 }
 
 fn merge_inline_choices(resolutions: &mut ResolutionSet, choices: &[String]) -> Result<()> {
+    let mut inline_choices = BTreeMap::new();
     for choice in choices {
         let (conflict_id, variant_id) = choice.split_once('=').with_context(|| {
             format!("--choose must be CONFLICT_ID=PAK_OPTION_ID; received `{choice}`")
@@ -365,26 +442,26 @@ fn merge_inline_choices(resolutions: &mut ResolutionSet, choices: &[String]) -> 
         if conflict_id.is_empty() || variant_id.is_empty() || variant_id.contains('=') {
             bail!("--choose must be CONFLICT_ID=PAK_OPTION_ID; received `{choice}`");
         }
-        if let Some(existing) = resolutions.choices.get(conflict_id) {
+        if let Some(existing) = inline_choices.get(conflict_id) {
             if existing != variant_id {
                 bail!(
                     "--choose assigns conflict {conflict_id} more than once ({existing} and {variant_id})"
                 );
             }
         } else {
-            resolutions
-                .choices
-                .insert(conflict_id.to_owned(), variant_id.to_owned());
+            inline_choices.insert(conflict_id.to_owned(), variant_id.to_owned());
         }
     }
+    resolutions.choices.extend(inline_choices);
     Ok(())
 }
 
 fn run_verify(args: VerifyArgs) -> Result<()> {
-    let result = verify(&args.pak, None).context("the Pak check could not be completed")?;
+    let result =
+        verify(&args.pak, None).context("the structural Pak check could not be completed")?;
     emit_json(args.output.as_deref(), &result)?;
     if !result.valid {
-        bail!("the Pak did not pass verification");
+        bail!("the Pak did not pass structural verification");
     }
     Ok(())
 }
@@ -405,16 +482,21 @@ fn print_json<T: Serialize>(value: &T) -> Result<()> {
 }
 
 fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
-    let file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .with_context(|| {
-            format!(
-                "output file already exists; choose a new path: {}",
-                path.display()
-            )
-        })?;
+    let file = match OpenOptions::new().write(true).create_new(true).open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(error).with_context(|| {
+                format!(
+                    "output file already exists; choose a new path: {}",
+                    path.display()
+                )
+            });
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("couldn't create the output file: {}", path.display()));
+        }
+    };
     let mut writer = BufWriter::new(file);
     if let Err(error) = serde_json::to_writer_pretty(&mut writer, value)
         .and_then(|()| writer.write_all(b"\n").map_err(serde_json::Error::io))
@@ -431,6 +513,7 @@ fn write_json_new<T: Serialize>(path: &Path, value: &T) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     #[test]
     fn parser_exposes_only_pak_workflow_commands() {
@@ -560,5 +643,114 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("more than once"));
+    }
+
+    #[test]
+    fn inline_choices_override_saved_resolution_file_values() {
+        let mut resolutions = ResolutionSet::default();
+        resolutions
+            .choices
+            .insert("conflict".to_owned(), "saved".to_owned());
+
+        merge_inline_choices(&mut resolutions, &["conflict=inline".to_owned()]).unwrap();
+
+        assert_eq!(
+            resolutions.choices.get("conflict").map(String::as_str),
+            Some("inline")
+        );
+    }
+
+    #[test]
+    fn analyze_canonicalizes_relative_input_and_base_paths() {
+        let current = fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix("canonical-analysis-")
+            .tempdir_in(&current)
+            .unwrap();
+        let first = directory.path().join("A_P.pak");
+        let second = directory.path().join("B_P.pak");
+        fs::write(&first, b"a").unwrap();
+        fs::write(&second, b"b").unwrap();
+        let relative_directory = directory.path().strip_prefix(&current).unwrap();
+        let relative_first = relative_directory.join("A_P.pak");
+        let relative_second = relative_directory.join("B_P.pak");
+
+        let request = canonicalize_analysis_request(
+            vec![relative_first.clone(), relative_second],
+            relative_first,
+        )
+        .unwrap();
+
+        assert!(request.pak_paths.iter().all(|path| path.is_absolute()));
+        assert_eq!(request.pak_paths[0], fs::canonicalize(first).unwrap());
+        assert_eq!(request.pak_paths[1], fs::canonicalize(second).unwrap());
+        assert_eq!(request.carrier_path, request.pak_paths[0]);
+    }
+
+    #[test]
+    fn output_creation_distinguishes_existing_files_from_other_io_errors() {
+        let directory = tempfile::tempdir().unwrap();
+        let existing = directory.path().join("existing.json");
+        fs::write(&existing, b"keep").unwrap();
+
+        let existing_error = write_json_new(&existing, &1_u8).unwrap_err();
+        assert!(existing_error.to_string().contains("already exists"));
+        assert_eq!(fs::read(&existing).unwrap(), b"keep");
+
+        let missing_parent = directory.path().join("missing").join("output.json");
+        let create_error = write_json_new(&missing_parent, &1_u8).unwrap_err();
+        assert!(
+            create_error
+                .to_string()
+                .contains("couldn't create the output file")
+        );
+        assert!(!create_error.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn verify_help_states_that_verification_is_structural_only() {
+        let mut command = Cli::command();
+        let verify = command.find_subcommand_mut("verify").unwrap();
+        let help = verify.render_long_help().to_string();
+        assert!(help.contains("structural integrity"));
+        assert!(help.contains("does not compare against a saved merge report"));
+    }
+
+    #[test]
+    fn cli_analysis_uses_the_shared_cancellation_token() {
+        use pak_merger::pak::{PakWriteEntry, write_pak_v11_to};
+        use std::io::Cursor;
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("First_P.pak");
+        let second = directory.path().join("Second_P.pak");
+        for (path, contents) in [
+            (&first, b"first".as_slice()),
+            (&second, b"second".as_slice()),
+        ] {
+            let pak = write_pak_v11_to(
+                Cursor::new(Vec::new()),
+                "../../../Game/Content/",
+                [PakWriteEntry::new("Data/Test.bin", contents.to_vec())],
+            )
+            .unwrap()
+            .into_inner();
+            fs::write(path, pak).unwrap();
+        }
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        let error = match open_analysis_session(
+            AnalysisRequest {
+                pak_paths: vec![first.clone(), second],
+                carrier_path: first,
+            },
+            &cancellation,
+        ) {
+            Ok(_) => panic!("a pre-cancelled CLI analysis must not start"),
+            Err(error) => error,
+        };
+
+        assert!(format!("{error:#}").contains("cancelled"));
     }
 }

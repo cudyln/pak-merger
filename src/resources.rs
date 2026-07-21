@@ -1,23 +1,32 @@
 //! Memory, worker, and temporary-storage limits for Pak operations.
 
 use std::env;
-use std::fs;
-use std::io;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
 
 pub const GIB: u64 = 1024 * 1024 * 1024;
 const FALLBACK_MEMORY_BUDGET: u64 = 8 * GIB;
 const MAX_MEMORY_BUDGET: u64 = 32 * GIB;
 const SYSTEM_RESERVE: u64 = GIB;
 const MAX_WORKER_THREADS: usize = 32;
+const STALE_TEMP_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const JOB_OWNERSHIP_FILE: &str = ".pak-merger-owner.lock";
+const INSTALL_JOURNAL_PREFIX: &str = "pak-merger-install-journal-";
+const INSTALL_JOURNAL_MAGIC: &str = "PAK_MERGER_INSTALL_SIDECAR_V1\n";
+const MAX_INSTALL_JOURNAL_BYTES: u64 = 64 * 1024;
 
 static MEMORY_BUDGET: OnceLock<u64> = OnceLock::new();
 static DECODED_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
 static PENDING_TEMPORARY_DISK_BYTES: AtomicU64 = AtomicU64::new(0);
+static TEMP_CLEANUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// Returns the real `tmp` directory beside the executable.
+/// Returns the work directory beside the executable when possible. Installed
+/// copies in a read-only folder fall back to the current user's local data
+/// directory (or the operating-system temporary directory).
 pub(crate) fn runtime_temp_directory() -> io::Result<PathBuf> {
     let executable = env::current_exe().map_err(|error| {
         io::Error::new(
@@ -25,7 +34,17 @@ pub(crate) fn runtime_temp_directory() -> io::Result<PathBuf> {
             format!("could not locate the running Pak Merger executable: {error}"),
         )
     })?;
-    runtime_temp_directory_for_executable(&executable)
+    let directory = runtime_temp_directory_for_executable(&executable).or_else(|_| {
+        let fallback_root = env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(env::temp_dir)
+            .join("PakMerger");
+        runtime_temp_directory_at(&fallback_root.join("tmp"), true)
+    })?;
+    TEMP_CLEANUP_DONE.get_or_init(|| {
+        let _ = cleanup_stale_runtime_artifacts(&directory, SystemTime::now());
+    });
+    Ok(directory)
 }
 
 fn runtime_temp_directory_for_executable(executable: &Path) -> io::Result<PathBuf> {
@@ -35,12 +54,26 @@ fn runtime_temp_directory_for_executable(executable: &Path) -> io::Result<PathBu
             "the Pak Merger executable has no parent folder",
         )
     })?;
-    let temp_directory = executable_directory.join("tmp");
+    runtime_temp_directory_at(&executable_directory.join("tmp"), false)
+}
 
-    match fs::symlink_metadata(&temp_directory) {
-        Ok(metadata) => validate_runtime_temp_directory(&temp_directory, &metadata)?,
+fn runtime_temp_directory_at(temp_directory: &Path, create_parents: bool) -> io::Result<PathBuf> {
+    if create_parents && let Some(parent) = temp_directory.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!(
+                    "could not create the temporary work folder {}: {error}",
+                    temp_directory.display()
+                ),
+            )
+        })?;
+    }
+
+    match fs::symlink_metadata(temp_directory) {
+        Ok(metadata) => validate_runtime_temp_directory(temp_directory, &metadata)?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            match fs::create_dir(&temp_directory) {
+            match fs::create_dir(temp_directory) {
                 Ok(()) => {}
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => {
@@ -53,7 +86,7 @@ fn runtime_temp_directory_for_executable(executable: &Path) -> io::Result<PathBu
                     ));
                 }
             }
-            let metadata = fs::symlink_metadata(&temp_directory).map_err(|error| {
+            let metadata = fs::symlink_metadata(temp_directory).map_err(|error| {
                 io::Error::new(
                     error.kind(),
                     format!(
@@ -62,7 +95,7 @@ fn runtime_temp_directory_for_executable(executable: &Path) -> io::Result<PathBu
                     ),
                 )
             })?;
-            validate_runtime_temp_directory(&temp_directory, &metadata)?;
+            validate_runtime_temp_directory(temp_directory, &metadata)?;
         }
         Err(error) => {
             return Err(io::Error::new(
@@ -75,7 +108,231 @@ fn runtime_temp_directory_for_executable(executable: &Path) -> io::Result<PathBu
         }
     }
 
-    Ok(temp_directory)
+    Ok(temp_directory.to_path_buf())
+}
+
+fn cleanup_stale_runtime_artifacts(directory: &Path, now: SystemTime) -> io::Result<()> {
+    for entry in fs::read_dir(directory)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(_) => continue,
+        };
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let owned_name = name.starts_with("pak-merger-");
+        if !owned_name {
+            continue;
+        }
+        if name.starts_with(INSTALL_JOURNAL_PREFIX) {
+            cleanup_abandoned_install_journal(&entry.path());
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(_) => continue,
+        };
+        if metadata.is_dir() && entry.path().join(JOB_OWNERSHIP_FILE).is_file() {
+            cleanup_abandoned_job_directory(&entry.path());
+            continue;
+        }
+        let old_enough = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_some_and(|age| age >= STALE_TEMP_AGE);
+        if !old_enough {
+            continue;
+        }
+        if metadata.is_dir() {
+            let _ = fs::remove_dir_all(entry.path());
+        } else if metadata.is_file() {
+            cleanup_stale_owned_file(&entry.path());
+        }
+    }
+    Ok(())
+}
+
+fn cleanup_stale_owned_file(path: &Path) {
+    use fs2::FileExt;
+
+    let Ok(file) = OpenOptions::new().read(true).write(true).open(path) else {
+        return;
+    };
+    if file.try_lock_exclusive().is_err() {
+        return;
+    }
+    let _ = FileExt::unlock(&file);
+    drop(file);
+    let _ = fs::remove_file(path);
+}
+
+/// Marks one temporary job directory as owned by a live process. The open,
+/// exclusively locked marker lets a later launch distinguish an abandoned
+/// directory from a merge that is still running in another process.
+pub(crate) fn lock_runtime_job_directory(directory: &Path) -> io::Result<File> {
+    use fs2::FileExt;
+
+    let marker_path = directory.join(JOB_OWNERSHIP_FILE);
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)?;
+    marker.lock_exclusive()?;
+    marker.write_all(b"Pak Merger temporary job\n")?;
+    marker.sync_all()?;
+    Ok(marker)
+}
+
+fn cleanup_abandoned_job_directory(directory: &Path) {
+    use fs2::FileExt;
+
+    let marker_path = directory.join(JOB_OWNERSHIP_FILE);
+    let Ok(marker) = OpenOptions::new().read(true).write(true).open(marker_path) else {
+        return;
+    };
+    if marker.try_lock_exclusive().is_err() {
+        return;
+    }
+    let _ = FileExt::unlock(&marker);
+    drop(marker);
+    let _ = fs::remove_dir_all(directory);
+}
+
+/// Keeps a recovery record for a cross-volume output copy. Normal completion
+/// removes the record through `NamedTempFile`; after a process kill, the next
+/// launch can remove only the exact app-created `.partial` file it names.
+pub(crate) struct InstallSidecarJournal {
+    _journal: tempfile::NamedTempFile,
+}
+
+pub(crate) fn register_install_sidecar(sidecar: &Path) -> io::Result<InstallSidecarJournal> {
+    use fs2::FileExt;
+
+    let sidecar = fs::canonicalize(sidecar)?;
+    let file_name = sidecar.file_name().and_then(|name| name.to_str());
+    if !file_name.is_some_and(is_install_sidecar_name) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "the install recovery record was given an unexpected file name",
+        ));
+    }
+    let directory = runtime_temp_directory()?;
+    let mut journal = tempfile::Builder::new()
+        .prefix(INSTALL_JOURNAL_PREFIX)
+        .suffix(".txt")
+        .tempfile_in(directory)?;
+    journal.as_file().lock_exclusive()?;
+    journal.write_all(INSTALL_JOURNAL_MAGIC.as_bytes())?;
+    journal.write_all(sidecar.to_string_lossy().as_bytes())?;
+    journal.write_all(b"\n")?;
+    journal.as_file_mut().sync_all()?;
+    Ok(InstallSidecarJournal { _journal: journal })
+}
+
+fn cleanup_abandoned_install_journal(journal_path: &Path) {
+    use fs2::FileExt;
+
+    let Ok(mut journal) = OpenOptions::new().read(true).write(true).open(journal_path) else {
+        return;
+    };
+    if journal.try_lock_exclusive().is_err() {
+        return;
+    }
+    let size = journal.metadata().map(|metadata| metadata.len());
+    if !matches!(size, Ok(size) if size <= MAX_INSTALL_JOURNAL_BYTES) {
+        return;
+    }
+    let mut text = String::new();
+    if journal.read_to_string(&mut text).is_err() {
+        return;
+    }
+    let Some(path_text) = text.strip_prefix(INSTALL_JOURNAL_MAGIC) else {
+        return;
+    };
+    let sidecar = PathBuf::from(path_text.trim_end_matches(['\r', '\n']));
+    let valid_name = sidecar
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(is_install_sidecar_name);
+    let recovery_complete = if !valid_name {
+        true
+    } else {
+        match fs::symlink_metadata(&sidecar) {
+            Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => {
+                match fs::remove_file(&sidecar) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+                    Err(_) => false,
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Ok(_) | Err(_) => false,
+        }
+    };
+    let _ = FileExt::unlock(&journal);
+    drop(journal);
+    if recovery_complete {
+        let _ = fs::remove_file(journal_path);
+    }
+}
+
+fn is_install_sidecar_name(name: &str) -> bool {
+    name.starts_with(".pak-merger-install-") && name.ends_with(".partial")
+}
+
+/// Stable comparison key for a host path. Existing paths are canonicalized;
+/// for a not-yet-created output, its existing parent is canonicalized instead.
+pub fn path_identity_key(path: &Path) -> String {
+    let resolved = fs::canonicalize(path).or_else(|_| {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            env::current_dir()?.join(path)
+        };
+        let Some(name) = absolute.file_name() else {
+            return Ok(absolute);
+        };
+        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
+        Ok::<_, io::Error>(fs::canonicalize(parent)?.join(name))
+    });
+    resolved
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .replace('\\', "/")
+        .to_lowercase()
+}
+
+/// Compares existing files by filesystem identity on Windows, with a
+/// canonical-path fallback for paths that cannot be opened.
+pub fn same_file_path(left: &Path, right: &Path) -> bool {
+    #[cfg(windows)]
+    if let (Ok(left), Ok(right)) = (windows_file_identity(left), windows_file_identity(right)) {
+        return left == right;
+    }
+    path_identity_key(left) == path_identity_key(right)
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn windows_file_identity(path: &Path) -> io::Result<(u32, u64)> {
+    use std::fs::File;
+    use std::mem::zeroed;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let file = File::open(path)?;
+    // SAFETY: `information` is initialized to zero and the live File handle and
+    // correctly-sized output structure remain valid for the entire call.
+    let mut information: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    let succeeded = unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) };
+    if succeeded == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let index =
+        (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow);
+    Ok((information.dwVolumeSerialNumber, index))
 }
 
 fn validate_runtime_temp_directory(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
@@ -103,6 +360,13 @@ pub fn memory_budget_bytes() -> u64 {
 /// Process-wide RAM cache limit for decoded entries.
 pub fn decoded_memory_cache_limit_bytes() -> u64 {
     decoded_memory_cache_limit_from_budget(memory_budget_bytes())
+}
+
+/// RAM still available to the decoded-entry cache at this instant. Disk-space
+/// preflight uses this only as a best-case reservation; the decode path keeps
+/// its own atomic enforcement if concurrent work changes the value later.
+pub(crate) fn decoded_memory_cache_available_bytes() -> u64 {
+    decoded_memory_cache_limit_bytes().saturating_sub(DECODED_CACHE_BYTES.load(Ordering::Acquire))
 }
 
 fn decoded_memory_cache_limit_from_budget(memory_budget: u64) -> u64 {
@@ -310,6 +574,179 @@ mod tests {
 
         assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
         assert_eq!(fs::read(work_path).unwrap(), b"not a folder");
+    }
+
+    #[test]
+    fn fallback_work_folder_creates_missing_parents() {
+        let root = tempfile::tempdir().unwrap();
+        let work_path = root.path().join("PakMerger").join("tmp");
+
+        let created = runtime_temp_directory_at(&work_path, true).unwrap();
+
+        assert_eq!(created, work_path);
+        assert!(created.is_dir());
+    }
+
+    #[test]
+    fn stale_cleanup_removes_only_owned_artifacts() {
+        let root = tempfile::tempdir().unwrap();
+        let stale_job = root.path().join("pak-merger-stale");
+        let unrelated = root.path().join("notes.txt");
+        fs::create_dir(&stale_job).unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        let future = SystemTime::now() + STALE_TEMP_AGE + Duration::from_secs(1);
+
+        cleanup_stale_runtime_artifacts(root.path(), future).unwrap();
+
+        assert!(!stale_job.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn stale_cleanup_preserves_current_jobs() {
+        let root = tempfile::tempdir().unwrap();
+        let current_job = root.path().join("pak-merger-current");
+        fs::create_dir(&current_job).unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+
+        assert!(current_job.is_dir());
+    }
+
+    #[test]
+    fn ownership_lock_preserves_live_job_and_reclaims_abandoned_job() {
+        let root = tempfile::tempdir().unwrap();
+        let job = root.path().join("pak-merger-owned-job");
+        fs::create_dir(&job).unwrap();
+        let ownership = lock_runtime_job_directory(&job).unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(job.is_dir());
+
+        drop(ownership);
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(!job.exists());
+    }
+
+    #[test]
+    fn abandoned_install_journal_removes_only_named_partial() {
+        let root = tempfile::tempdir().unwrap();
+        let partial = root.path().join(".pak-merger-install-test.partial");
+        let journal = root.path().join("pak-merger-install-journal-stale.txt");
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{INSTALL_JOURNAL_MAGIC}{}\n",
+                fs::canonicalize(&partial).unwrap().display()
+            ),
+        )
+        .unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+
+        assert!(!partial.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn install_journal_lock_preserves_a_live_cross_volume_copy() {
+        use fs2::FileExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let partial = root.path().join(".pak-merger-install-live.partial");
+        let journal_path = root.path().join("pak-merger-install-journal-live.txt");
+        fs::write(&partial, b"partial").unwrap();
+        let mut journal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&journal_path)
+            .unwrap();
+        writeln!(
+            journal,
+            "{INSTALL_JOURNAL_MAGIC}{}",
+            fs::canonicalize(&partial).unwrap().display()
+        )
+        .unwrap();
+        journal.flush().unwrap();
+        journal.lock_exclusive().unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(partial.exists());
+        assert!(journal_path.exists());
+
+        drop(journal);
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(!partial.exists());
+        assert!(!journal_path.exists());
+    }
+
+    #[test]
+    fn install_journal_never_removes_an_unrelated_file() {
+        let root = tempfile::tempdir().unwrap();
+        let unrelated = root.path().join("keep.txt");
+        let journal = root.path().join("pak-merger-install-journal-invalid.txt");
+        fs::write(&unrelated, b"keep").unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{INSTALL_JOURNAL_MAGIC}{}\n",
+                fs::canonicalize(&unrelated).unwrap().display()
+            ),
+        )
+        .unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+        assert!(!journal.exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn install_journal_survives_a_transient_sidecar_delete_failure() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+        let root = tempfile::tempdir().unwrap();
+        let partial = root.path().join(".pak-merger-install-retry.partial");
+        let journal = root.path().join("pak-merger-install-journal-retry.txt");
+        fs::write(&partial, b"partial").unwrap();
+        fs::write(
+            &journal,
+            format!(
+                "{INSTALL_JOURNAL_MAGIC}{}\n",
+                fs::canonicalize(&partial).unwrap().display()
+            ),
+        )
+        .unwrap();
+        let blocking_handle = OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+            .open(&partial)
+            .unwrap();
+
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(partial.exists());
+        assert!(journal.exists());
+
+        drop(blocking_handle);
+        cleanup_stale_runtime_artifacts(root.path(), SystemTime::now()).unwrap();
+        assert!(!partial.exists());
+        assert!(!journal.exists());
+    }
+
+    #[test]
+    fn path_identity_handles_relative_and_hard_link_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let original = root.path().join("Original.pak");
+        let alias = root.path().join("Alias.pak");
+        fs::write(&original, b"pak").unwrap();
+        fs::hard_link(&original, &alias).unwrap();
+
+        assert!(same_file_path(&original, &alias));
+        assert!(!same_file_path(&original, &root.path().join("Other.pak")));
     }
 
     #[test]

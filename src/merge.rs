@@ -2,7 +2,7 @@
 use crate::binary_asset::BinaryAsset;
 use crate::binary_asset::{
     self, AtomicDonorSelection, IndexedBinaryAsset, IndexedRow, IntegerValue, MsgpackKind, NodeRef,
-    RowId,
+    RowFieldIndex, RowId,
 };
 use crate::control::CancellationToken;
 use crate::pak::{self, PackageComponent, PakArchive};
@@ -40,6 +40,9 @@ std::thread_local! {
         std::cell::Cell::new(0)
     };
     static TEST_ATOMIC_VARIANT_ROW_PARSE_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    static TEST_INDEXED_ROW_PARSE_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
 }
@@ -347,7 +350,13 @@ fn indexed_row<'a>(
     match result {
         Err(binary_asset::BinaryAssetError::Cancelled) => Err(MergeError::Cancelled),
         Err(error) => Err(error.into()),
-        Ok(row) => Ok(row),
+        Ok(row) => {
+            #[cfg(test)]
+            if row.is_some() {
+                TEST_INDEXED_ROW_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
+            }
+            Ok(row)
+        }
     }
 }
 
@@ -388,6 +397,10 @@ struct OpenedPak {
 pub struct MergeAnalysisSession {
     plan: Arc<MergePlan>,
     opened: Vec<OpenedPak>,
+    /// The exact immutable profile registry used to create `plan`. Keeping it
+    /// in the session guarantees that output generation uses the same atomic
+    /// field groups as analysis, including caller-supplied external profiles.
+    profile_registry: Arc<profiles::ProfileRegistry>,
     /// Analysis-owned compact indexes. `IndexedBinaryAsset` keeps the original
     /// archive slice or decoded cache mapping alive without copying the entry.
     parsed_databases: BTreeMap<String, Vec<ParsedDbProvider>>,
@@ -409,6 +422,11 @@ impl MergeAnalysisSession {
         // Logical bytes referenced by the disk-backed database cache, not
         // resident parsed-tree memory.
         self.cached_database_bytes
+    }
+
+    /// Returns the immutable profile registry pinned to this analysis.
+    pub fn profile_registry(&self) -> &profiles::ProfileRegistry {
+        &self.profile_registry
     }
 }
 
@@ -496,6 +514,8 @@ struct NpcPlacementOccurrence {
     binding: NpcPlacementBinding,
 }
 
+type NpcPlacementMap = BTreeMap<NpcPlacementLogicalKey, Vec<NpcPlacementOccurrence>>;
+
 #[derive(Debug, Clone)]
 enum OutputSource {
     Pak { input_index: usize, path: String },
@@ -519,7 +539,47 @@ impl Drop for RemoveFileOnDrop {
 pub fn analyze(request: AnalysisRequest) -> Result<MergePlan> {
     validate_request(&request)?;
     let opened = open_paks(&request)?;
-    Ok(analyze_opened(request, &opened, None, true, &mut |_, _, _| {})?.0)
+    Ok(analyze_opened(
+        request,
+        &opened,
+        profiles::default_registry(),
+        None,
+        true,
+        &mut |_, _, _| {},
+    )?
+    .0)
+}
+
+/// Analyzes Pak files with a caller-supplied immutable profile registry and
+/// retains everything required to write the result without reopening or
+/// reanalyzing the inputs.
+///
+/// Use [`write_session_with_options_and_progress`] or
+/// [`write_session_with_options_progress_and_cancel`] with the returned
+/// session. The compatibility [`write`] API intentionally uses only built-in
+/// profiles because a serialized [`ResolvedPlan`] does not carry executable
+/// profile rules.
+pub fn analyze_session_with_registry(
+    request: AnalysisRequest,
+    profile_registry: Arc<profiles::ProfileRegistry>,
+) -> Result<MergeAnalysisSession> {
+    validate_request(&request)?;
+    let opened = open_paks(&request)?;
+    let (plan, parsed_databases, cached_database_bytes) = analyze_opened(
+        request,
+        &opened,
+        &profile_registry,
+        None,
+        true,
+        &mut |_, _, _| {},
+    )?;
+    Ok(MergeAnalysisSession {
+        plan: Arc::new(plan),
+        opened,
+        profile_registry,
+        parsed_databases,
+        cached_database_bytes,
+    })
 }
 
 /// Analyze archives retained by the fast structural inspection. Compressed
@@ -566,12 +626,14 @@ pub fn analyze_with_archives_progress_cancel_and_threads<F>(
 where
     F: FnMut(usize, usize, Option<String>),
 {
+    let profile_registry = Arc::new(profiles::ProfileRegistry::with_builtins());
     check_cancel(Some(cancelled))?;
     validate_cached_request(&request, &archives)?;
     let opened = opened_from_archives(&request, archives)?;
     let (plan, parsed_databases, cached_database_bytes) = analyze_opened(
         request,
         &opened,
+        &profile_registry,
         Some(cancelled),
         multithreaded,
         &mut progress,
@@ -579,6 +641,7 @@ where
     Ok(MergeAnalysisSession {
         plan: Arc::new(plan),
         opened,
+        profile_registry,
         parsed_databases,
         cached_database_bytes,
     })
@@ -587,6 +650,7 @@ where
 fn analyze_opened(
     request: AnalysisRequest,
     opened: &[OpenedPak],
+    profile_registry: &profiles::ProfileRegistry,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
     progress: &mut dyn FnMut(usize, usize, Option<String>),
@@ -600,7 +664,7 @@ fn analyze_opened(
             )
         })?;
     let carrier_input_id = opened[carrier_index].descriptor.id.clone();
-    let profile_detection = detect_profile_from_opened_inventory(opened);
+    let profile_detection = detect_profile_from_opened_inventory(opened, profile_registry);
     let selected_profile_id = profile_detection.selected_profile_id.clone();
     let (package_map, loose_map) = collect_providers(opened);
     let mut assets = Vec::new();
@@ -658,6 +722,7 @@ fn analyze_opened(
         &units,
         opened,
         carrier_index,
+        profile_registry,
         selected_profile_id.as_deref(),
         cancelled,
         multithreaded,
@@ -697,7 +762,7 @@ fn analyze_opened(
             .chain(conflicts.iter().map(|conflict| conflict.id.as_str())),
     );
     let plan = MergePlan {
-        schema_version: 1,
+        schema_version: MERGE_PLAN_SCHEMA_VERSION,
         plan_id,
         request,
         inputs,
@@ -785,6 +850,7 @@ where
     F: FnMut(MergeProgress) + Send,
 {
     require_output_path(output_path)?;
+    reject_output_input_alias(output_path, &resolved.plan.request.pak_paths)?;
     let existing_output = capture_output_target(output_path, options.overwrite_existing)?;
 
     validate_request(&resolved.plan.request)?;
@@ -799,6 +865,7 @@ where
         };
         open_paks_with_progress(&resolved.plan.request, &mut input_progress)?
     };
+    verify_input_identities(&opened, &resolved.plan.inputs)?;
     progress(MergeProgress {
         stage: MergeProgressStage::ComparingChanges,
         completed: 0,
@@ -808,6 +875,7 @@ where
     let (current_plan, parsed_databases, _) = analyze_opened(
         resolved.plan.request.clone(),
         &opened,
+        profiles::default_registry(),
         None,
         true,
         &mut |_, _, _| {},
@@ -825,12 +893,12 @@ where
     }
     let mut resolutions = resolved.resolutions;
     validate_resolutions(&current_plan, &mut resolutions)?;
-    verify_input_identities(&opened, &current_plan.inputs)?;
     write_opened_with_progress(
         &current_plan,
         &resolutions,
         &opened,
         &parsed_databases,
+        profiles::default_registry(),
         output_path,
         options,
         existing_output,
@@ -877,6 +945,7 @@ where
 {
     check_cancel(Some(cancelled))?;
     require_output_path(output_path)?;
+    reject_output_input_alias(output_path, &session.plan.request.pak_paths)?;
     let existing_output = capture_output_target(output_path, options.overwrite_existing)?;
     verify_session_input_stamps(&session.opened)?;
     let mut resolutions = resolutions;
@@ -886,6 +955,7 @@ where
         &resolutions,
         &session.opened,
         &session.parsed_databases,
+        &session.profile_registry,
         output_path,
         options,
         existing_output,
@@ -900,6 +970,7 @@ fn write_opened_with_progress<F>(
     resolutions: &ResolutionSet,
     opened: &[OpenedPak],
     parsed_databases: &BTreeMap<String, Vec<ParsedDbProvider>>,
+    profile_registry: &profiles::ProfileRegistry,
     output_path: &Path,
     options: WriteOptions,
     existing_output: Option<OutputTargetStamp>,
@@ -922,6 +993,7 @@ where
     let temp_dir = tempfile::Builder::new()
         .prefix("pak-merger-")
         .tempdir_in(&runtime_temp_root)?;
+    let _temp_directory_ownership = resources::lock_runtime_job_directory(temp_dir.path())?;
     let mut output_entries = Vec::new();
     let mut raw_preserved_nodes = 0_u64;
     let mut raw_replaced_nodes = 0_u64;
@@ -936,7 +1008,10 @@ where
             total: asset_total as u64,
             current_item: Some(asset.virtual_path.clone()),
         });
-        if let Some(providers) = package_map.get(&sort_key(&asset.virtual_path)) {
+        let asset_key = sort_key(&asset.virtual_path);
+        let loose_asset =
+            asset.package_entries.len() == 1 && sort_key(&asset.package_entries[0]) == asset_key;
+        if !loose_asset && let Some(providers) = package_map.get(&asset_key) {
             match asset.action {
                 AssetActionKind::Copy | AssetActionKind::Deduplicate => {
                     let donor = donor_for_asset(asset, providers, opened)?;
@@ -967,6 +1042,7 @@ where
                         resolutions,
                         opened,
                         parsed,
+                        profile_registry,
                         carrier_index,
                         cancelled,
                         &uexp_path,
@@ -986,7 +1062,7 @@ where
                     });
                 }
             }
-        } else if let Some(providers) = loose_map.get(&sort_key(&asset.virtual_path)) {
+        } else if let Some(providers) = loose_map.get(&asset_key) {
             let donor = match asset.action {
                 AssetActionKind::Copy | AssetActionKind::Deduplicate => &providers[0],
                 AssetActionKind::SelectOpaque | AssetActionKind::Unsupported => {
@@ -1033,10 +1109,24 @@ where
     let mut source_map = BTreeMap::new();
     let mut paths = Vec::with_capacity(output_entries.len());
     let mut disk_estimate_entries = Vec::with_capacity(output_entries.len());
+    let mut selected_decode_entries = BTreeSet::new();
+    let mut input_decode_temp_sizes = Vec::new();
+    let mut decoded_ram_available = resources::decoded_memory_cache_available_bytes();
     let mut total_logical_bytes = 0_u64;
     for entry in output_entries {
         let size = match &entry.source {
             OutputSource::Pak { input_index, path } => {
+                if selected_decode_entries.insert((*input_index, sort_key(path))) {
+                    let info = opened[*input_index].archive.entry_decode_info(path)?;
+                    if info.compressed && !info.decoded_cache_present {
+                        if info.memory_cache_eligible && info.logical_size <= decoded_ram_available
+                        {
+                            decoded_ram_available -= info.logical_size;
+                        } else {
+                            input_decode_temp_sizes.push(info.logical_size);
+                        }
+                    }
+                }
                 opened[*input_index].archive.entry_size(path)?
             }
             OutputSource::Temporary(path) => fs::metadata(path)?.len(),
@@ -1051,6 +1141,21 @@ where
     }
     let progress_total_bytes = total_logical_bytes.max(1);
     let mount = opened[carrier_index].canonical_mount_point.clone();
+    if !direct_output_install {
+        let output_parent = output_path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let allocation_unit = fs2::allocation_granularity(output_parent)?.max(1);
+        let required = estimated_pak_file_upper_bound(
+            &mount,
+            &disk_estimate_entries,
+            options.compression,
+            allocation_unit,
+            cancelled,
+        )?;
+        ensure_destination_copy_space(output_parent, required)?;
+    }
     // Database staging files already occupy the executable's work volume at this
     // point. Check only the remaining bytes needed for the partial Pak and,
     // for compressed output, its one strict decoded verification cache.
@@ -1059,6 +1164,8 @@ where
         &mount,
         &disk_estimate_entries,
         options.compression,
+        &input_decode_temp_sizes,
+        cancelled,
     )?;
     check_cancel(cancelled)?;
     let no_cancellation = CancellationToken::new();
@@ -1563,7 +1670,7 @@ fn validate_request_shape(request: &AnalysisRequest) -> Result<()> {
                 path.display()
             )));
         }
-        let key = sort_key(&path.to_string_lossy());
+        let key = resources::path_identity_key(path);
         if !unique.insert(key) {
             return Err(MergeError::InvalidRequest(format!(
                 "duplicate Pak input: {}",
@@ -1622,7 +1729,7 @@ fn open_paks_with_progress(
     let total = request.pak_paths.len();
     for (index, path) in request.pak_paths.iter().enumerate() {
         progress(index, total, path);
-        let archive = Arc::new(PakArchive::open(path)?);
+        let archive = Arc::new(PakArchive::open_fast(path)?);
         let inventory = archive.inventory();
         if let Some(first_path) =
             archive_sources.insert(inventory.archive_sha256.clone(), path.clone())
@@ -1670,7 +1777,7 @@ fn opened_from_archives(
 ) -> Result<Vec<OpenedPak>> {
     let mut by_path = BTreeMap::new();
     for archive in archives {
-        let key = sort_key(&archive.inventory().source_path.to_string_lossy());
+        let key = resources::path_identity_key(&archive.inventory().source_path);
         if by_path.insert(key, archive).is_some() {
             return Err(MergeError::InvalidRequest(
                 "the inspection cache contains the same Pak path more than once".to_owned(),
@@ -1681,7 +1788,7 @@ fn opened_from_archives(
     let mut opened = Vec::with_capacity(request.pak_paths.len());
     let mut archive_sources = BTreeMap::<String, PathBuf>::new();
     for path in &request.pak_paths {
-        let key = sort_key(&path.to_string_lossy());
+        let key = resources::path_identity_key(path);
         let archive = by_path.remove(&key).ok_or_else(|| {
             MergeError::InvalidRequest(format!(
                 "the inspected Pak is no longer available in the analysis cache: {}",
@@ -1783,10 +1890,34 @@ fn canonicalize_mount_points(opened: &mut [OpenedPak], carrier_path: &Path) -> R
             })
             .count();
     }
-    if common_len == 0
-        || !mount_components[0][..common_len]
+    let common_names_a_root = common_len != 0
+        && mount_components[0][..common_len]
             .iter()
-            .any(|component| component != "..")
+            .any(|component| component != "..");
+    let has_parent_only_mount = mount_components
+        .iter()
+        .any(|components| components.iter().all(|component| component == ".."));
+    let named_mounts = mount_components
+        .iter()
+        .filter(|components| components.iter().any(|component| component != ".."))
+        .collect::<Vec<_>>();
+    let named_mounts_share_root = if let Some(first) = named_mounts.first() {
+        let mut named_common_len = first.len();
+        for components in &named_mounts[1..] {
+            named_common_len = (0..named_common_len.min(components.len()))
+                .take_while(|index| first[*index].eq_ignore_ascii_case(&components[*index]))
+                .count();
+        }
+        named_mounts.len() < 2
+            || first[..named_common_len]
+                .iter()
+                .any(|component| component != "..")
+    } else {
+        true
+    };
+    if common_len == 0
+        || (!common_names_a_root && !has_parent_only_mount)
+        || !named_mounts_share_root
     {
         let mounts = opened
             .iter()
@@ -1857,11 +1988,6 @@ fn safe_mount_components(mount_point: &str) -> Result<Vec<String>> {
         }
         components.push(component.to_owned());
     }
-    if !saw_named_component {
-        return Err(MergeError::InvalidRequest(format!(
-            "The Pak root path does not name a game folder: {mount_point}"
-        )));
-    }
     Ok(components)
 }
 
@@ -1899,7 +2025,10 @@ fn collect_providers(
 /// Detect a game profile only from the complete, canonicalized inventory.
 /// The common mount point is joined to every rebased asset path so a familiar
 /// table suffix in an unrelated game can never activate game-specific rules.
-fn detect_profile_from_opened_inventory(opened: &[OpenedPak]) -> profiles::ProfileDetection {
+fn detect_profile_from_opened_inventory(
+    opened: &[OpenedPak],
+    profile_registry: &profiles::ProfileRegistry,
+) -> profiles::ProfileDetection {
     let mut inventory = BTreeSet::new();
     for input in opened {
         let mount = input.canonical_mount_point.trim_end_matches('/');
@@ -1914,7 +2043,7 @@ fn detect_profile_from_opened_inventory(opened: &[OpenedPak]) -> profiles::Profi
             inventory.insert(format!("{mount}/{}", path.trim_start_matches('/')));
         }
     }
-    profiles::default_registry().detect_inventory(inventory.iter().map(String::as_str))
+    profile_registry.detect_inventory(inventory.iter().map(String::as_str))
 }
 
 const fn profile_detection_status_id(status: ProfileDetectionStatus) -> &'static str {
@@ -1949,17 +2078,20 @@ fn is_database_candidate(providers: &[GroupProvider]) -> bool {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_units(
     units: &[AnalysisUnit],
     opened: &[OpenedPak],
     carrier_index: usize,
+    profile_registry: &profiles::ProfileRegistry,
     selected_profile_id: Option<&str>,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
     progress: &mut dyn FnMut(usize, usize, Option<String>),
 ) -> Result<Vec<AnalysisUnitOutput>> {
     let worker_count = crate::resources::worker_threads().min(units.len());
-    if !multithreaded || units.len() < 2 || worker_count < 2 {
+    let outer_workers_active = multithreaded && units.len() >= 2 && worker_count >= 2;
+    if !outer_workers_active {
         let mut outputs = Vec::with_capacity(units.len());
         let mut tracker = AnalysisProgressTracker::new(units.len())?;
         for (index, unit) in units.iter().enumerate() {
@@ -1976,9 +2108,10 @@ fn analyze_units(
                     unit,
                     opened,
                     carrier_index,
+                    profile_registry,
                     selected_profile_id,
                     cancelled,
-                    multithreaded,
+                    inner_decode_multithreaded(multithreaded, false),
                     &mut detailed_progress,
                 )
             };
@@ -1991,6 +2124,7 @@ fn analyze_units(
 
     let (database_indices, independent_indices): (Vec<_>, Vec<_>) =
         (0..units.len()).partition(|&index| unit_requires_database_parse(&units[index]));
+    let inner_multithreaded = inner_decode_multithreaded(multithreaded, true);
 
     analyze_partitioned_units(
         units.len(),
@@ -2002,15 +2136,23 @@ fn analyze_units(
                 &units[index],
                 opened,
                 carrier_index,
+                profile_registry,
                 selected_profile_id,
                 cancelled,
-                multithreaded,
+                inner_multithreaded,
                 detailed_progress,
             )
         },
         |index| units[index].label(),
         progress,
     )
+}
+
+/// A parallel analysis worker already consumes the process CPU budget. Keep a
+/// single decode stream inside each outer worker so repak cannot create a full
+/// per-entry pool for every concurrently analyzed unit.
+fn inner_decode_multithreaded(requested: bool, outer_workers_active: bool) -> bool {
+    requested && !outer_workers_active
 }
 
 /// Runs database comparisons on at most two bounded workers while distributing
@@ -2190,10 +2332,12 @@ fn unit_requires_database_parse(unit: &AnalysisUnit) -> bool {
     matches!(unit, AnalysisUnit::Package(providers) if providers.len() > 1 && is_database_candidate(providers))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_unit(
     unit: &AnalysisUnit,
     opened: &[OpenedPak],
     carrier_index: usize,
+    profile_registry: &profiles::ProfileRegistry,
     selected_profile_id: Option<&str>,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
@@ -2237,6 +2381,7 @@ fn analyze_unit(
                     opened,
                     providers,
                     carrier_index,
+                    profile_registry,
                     selected_profile_id,
                     cancelled,
                     multithreaded,
@@ -2337,10 +2482,12 @@ type DatabaseAnalysis = (
     u64,
 );
 
+#[allow(clippy::too_many_arguments)]
 fn analyze_database_group(
     opened: &[OpenedPak],
     providers: &[GroupProvider],
     global_carrier_index: usize,
+    profile_registry: &profiles::ProfileRegistry,
     selected_profile_id: Option<&str>,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
@@ -2369,11 +2516,8 @@ fn analyze_database_group(
         .position(|provider| provider.input_index == global_carrier_index)
         .unwrap_or(0);
     let asset_path = parsed[carrier_local].group.base_path.clone();
-    let mut unit_planner = profiles::AtomicUnitPlanner::new(
-        profiles::default_registry(),
-        selected_profile_id,
-        &asset_path,
-    );
+    let mut unit_planner =
+        profiles::AtomicUnitPlanner::new(profile_registry, selected_profile_id, &asset_path);
     let mut row_ids = BTreeSet::new();
     for provider in &parsed {
         row_ids.extend(provider.asset.row_ids().iter().copied());
@@ -2382,9 +2526,25 @@ fn analyze_database_group(
     let mut warnings = Vec::new();
     let mut encoding_drift_count = 0_u64;
     let mut encoding_drift_samples = 0_usize;
+    let mut npc_placements = is_npc_set_list_asset(&asset_path).then(BTreeMap::new);
     if supporting_files_differ {
         warnings.push(format!(
             "{asset_path}: the related .uasset file differs between Paks. The merge will keep the base Pak file and update only its structurally verified data-size field. Check this database in game after merging."
+        ));
+    }
+    let partial_row_count = row_ids
+        .iter()
+        .filter(|row_id| {
+            parsed
+                .iter()
+                .filter(|provider| provider.asset.contains_row(**row_id))
+                .count()
+                != parsed.len()
+        })
+        .count();
+    if partial_row_count != 0 {
+        warnings.push(format!(
+            "{asset_path}: {partial_row_count} row(s) appear in only some Paks. Pak Merger keeps the union because a Pak alone cannot prove that a missing row was intentionally deleted."
         ));
     }
 
@@ -2403,9 +2563,10 @@ fn analyze_database_group(
         check_cancel(cancelled)?;
         let carrier_row = indexed_row(&parsed[carrier_local].asset, row_id, cancelled)?;
         if let Some(carrier_row) = carrier_row.as_ref() {
-            let carrier_layout = unit_planner.layout_for_row(&carrier_row.node)?;
+            let carrier_fields = RowFieldIndex::new(carrier_row.node_ref())?;
+            record_npc_placement(&carrier_fields, carrier_local, row_id, &mut npc_placements)?;
+            let carrier_layout = unit_planner.layout_for_field_view(carrier_fields.fields())?;
             struct UnitAnalysis {
-                unit: AtomicGroup,
                 first_semantic: Option<String>,
                 first_raw: Option<String>,
                 semantic_differs: bool,
@@ -2414,9 +2575,7 @@ fn analyze_database_group(
             let mut unit_analyses = carrier_layout
                 .units
                 .iter()
-                .cloned()
-                .map(|unit| UnitAnalysis {
-                    unit,
+                .map(|_| UnitAnalysis {
                     first_semantic: None,
                     first_raw: None,
                     semantic_differs: false,
@@ -2426,9 +2585,8 @@ fn analyze_database_group(
             let mut shape_mismatch = false;
             let mut atomic_layout_mismatch = false;
 
-            for analysis in &mut unit_analyses {
-                let hashes =
-                    binary_asset::atomic_group_hashes(carrier_row.node_ref(), &analysis.unit)?;
+            for (unit, analysis) in carrier_layout.units.iter().zip(&mut unit_analyses) {
+                let hashes = carrier_fields.atomic_group_hashes(unit)?;
                 analysis.first_semantic = Some(hashes.semantic_sha256);
                 analysis.first_raw = Some(hashes.raw_sha256);
             }
@@ -2445,8 +2603,12 @@ fn analyze_database_group(
                 let Some(row) = indexed_row(&provider.asset, row_id, cancelled)? else {
                     continue;
                 };
-                let Some(donor_layout) = unit_planner
-                    .layout_for_row_matching_field_order(&row.node, &carrier_layout.field_order)?
+                let row_fields = RowFieldIndex::new(row.node_ref())?;
+                record_npc_placement(&row_fields, local, row_id, &mut npc_placements)?;
+                let Some(donor_layout) = unit_planner.layout_for_field_view_matching_field_order(
+                    row_fields.fields(),
+                    &carrier_layout.field_order,
+                )?
                 else {
                     shape_mismatch = true;
                     continue;
@@ -2456,8 +2618,8 @@ fn analyze_database_group(
                 if !layout_matches {
                     continue;
                 }
-                for analysis in &mut unit_analyses {
-                    let hashes = binary_asset::atomic_group_hashes(row.node_ref(), &analysis.unit)?;
+                for (unit, analysis) in carrier_layout.units.iter().zip(&mut unit_analyses) {
+                    let hashes = row_fields.atomic_group_hashes(unit)?;
                     analysis.semantic_differs |= analysis
                         .first_semantic
                         .as_deref()
@@ -2505,21 +2667,22 @@ fn analyze_database_group(
             }
 
             struct PendingAtomicConflict {
-                unit: AtomicGroup,
+                unit_index: usize,
                 kind: ConflictKind,
                 message: &'static str,
                 blocking: bool,
             }
             let mut pending = Vec::new();
-            for analysis in unit_analyses {
+            for (unit_index, analysis) in unit_analyses.into_iter().enumerate() {
+                let unit = &carrier_layout.units[unit_index];
                 if analysis.semantic_differs {
-                    let kind = if analysis.unit.compound || analysis.unit.fields.len() > 1 {
+                    let kind = if unit.compound || unit.fields.len() > 1 {
                         ConflictKind::AtomicGroup
                     } else {
                         ConflictKind::FieldValue
                     };
                     pending.push(PendingAtomicConflict {
-                        unit: analysis.unit,
+                        unit_index,
                         kind,
                         message: "The saved values differ. Choose which Pak to use.",
                         blocking: true,
@@ -2528,7 +2691,7 @@ fn analyze_database_group(
                     encoding_drift_count = encoding_drift_count.saturating_add(1);
                     if encoding_drift_samples < MAX_ENCODING_DRIFT_SAMPLES_PER_ASSET {
                         pending.push(PendingAtomicConflict {
-                            unit: analysis.unit,
+                            unit_index,
                             kind: ConflictKind::EncodingDrift,
                             message: "The value is the same, but its storage format differs. The base Pak format will be kept.",
                             blocking: false,
@@ -2538,7 +2701,10 @@ fn analyze_database_group(
                 }
             }
             if !pending.is_empty() {
-                let pending_units = pending.iter().map(|item| &item.unit).collect::<Vec<_>>();
+                let pending_units = pending
+                    .iter()
+                    .map(|item| &carrier_layout.units[item.unit_index])
+                    .collect::<Vec<_>>();
                 let variants_by_unit = make_atomic_variant_sets(
                     opened,
                     &parsed,
@@ -2548,11 +2714,12 @@ fn analyze_database_group(
                     cancelled,
                 )?;
                 for (pending, variants) in pending.into_iter().zip(variants_by_unit) {
+                    let unit = &carrier_layout.units[pending.unit_index];
                     conflicts.push(make_conflict(
                         pending.kind,
                         &asset_path,
                         Some(row_id),
-                        Some(&pending.unit.id),
+                        Some(&unit.id),
                         pending.message,
                         variants,
                         pending.blocking,
@@ -2562,17 +2729,30 @@ fn analyze_database_group(
             }
         } else {
             let mut first_semantic = None;
+            let mut first_raw = None;
             let mut semantic_differs = false;
-            for provider in &parsed {
+            let mut raw_differs = false;
+            for (local, provider) in parsed.iter().enumerate() {
                 check_cancel(cancelled)?;
                 let Some(row) = indexed_row(&provider.asset, row_id, cancelled)? else {
                     continue;
                 };
+                let row_fields = RowFieldIndex::new(row.node_ref())?;
+                unit_planner.observe_field_view(row_fields.fields())?;
+                if npc_placements.is_some() {
+                    record_npc_placement(&row_fields, local, row_id, &mut npc_placements)?;
+                }
                 let semantic = row.node.semantic_sha256();
+                let raw = row.node_ref().raw_sha256();
                 if let Some(first) = first_semantic.as_deref() {
                     semantic_differs |= first != semantic;
                 } else {
                     first_semantic = Some(semantic);
+                }
+                if let Some(first) = first_raw.as_deref() {
+                    raw_differs |= first != raw;
+                } else {
+                    first_raw = Some(raw);
                 }
             }
             if semantic_differs {
@@ -2604,6 +2784,39 @@ fn analyze_database_group(
                     true,
                 ));
                 ensure_conflict_count(&conflicts)?;
+            } else if raw_differs {
+                encoding_drift_count = encoding_drift_count.saturating_add(1);
+                if encoding_drift_samples < MAX_ENCODING_DRIFT_SAMPLES_PER_ASSET {
+                    let mut variants = Vec::new();
+                    variants
+                        .try_reserve_exact(parsed.len())
+                        .map_err(|_| MergeError::AllocationFailed("row choices"))?;
+                    for provider in &parsed {
+                        check_cancel(cancelled)?;
+                        let Some(row) = indexed_row(&provider.asset, row_id, cancelled)? else {
+                            continue;
+                        };
+                        variants.push(make_row_variant(
+                            opened,
+                            provider,
+                            &asset_path,
+                            row_id,
+                            "$row",
+                            row.node_ref(),
+                        )?);
+                    }
+                    conflicts.push(make_conflict(
+                        ConflictKind::EncodingDrift,
+                        &asset_path,
+                        Some(row_id),
+                        Some("$row"),
+                        "The added row has the same values but a different storage format. The first selected input format will be kept.",
+                        variants,
+                        false,
+                    ));
+                    encoding_drift_samples += 1;
+                    ensure_conflict_count(&conflicts)?;
+                }
             }
         }
         let completed_rows = row_index + 1;
@@ -2617,8 +2830,16 @@ fn analyze_database_group(
         }
     }
 
+    unit_planner.validate_complete_profile_observation()?;
+
     let (mut placement_conflicts, mut placement_warnings) =
-        analyze_potential_npc_placement_collisions(opened, &parsed, &asset_path, cancelled)?;
+        analyze_potential_npc_placement_collisions(
+            opened,
+            &parsed,
+            &asset_path,
+            npc_placements.unwrap_or_default(),
+            cancelled,
+        )?;
     conflicts.append(&mut placement_conflicts);
     warnings.append(&mut placement_warnings);
     ensure_conflict_count(&conflicts)?;
@@ -2650,34 +2871,9 @@ fn analyze_potential_npc_placement_collisions(
     opened: &[OpenedPak],
     parsed: &[ParsedDbProvider],
     asset_path: &str,
+    placements: NpcPlacementMap,
     cancelled: Option<&CancellationToken>,
 ) -> Result<(Vec<Conflict>, Vec<String>)> {
-    if !is_npc_set_list_asset(asset_path) {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let mut placements = BTreeMap::<NpcPlacementLogicalKey, Vec<NpcPlacementOccurrence>>::new();
-    for (provider_local, provider) in parsed.iter().enumerate() {
-        for &row_id in provider.asset.row_ids() {
-            let row = indexed_row(&provider.asset, row_id, cancelled)?
-                .expect("indexed row ID remains available");
-            let Some(binding) = npc_placement_binding(&row.node)? else {
-                continue;
-            };
-            let Some(key) = npc_placement_logical_key(&row.node)? else {
-                continue;
-            };
-            placements
-                .entry(key)
-                .or_default()
-                .push(NpcPlacementOccurrence {
-                    provider_local,
-                    row_id,
-                    binding,
-                });
-        }
-    }
-
     let mut conflicts = Vec::new();
     let mut warnings = Vec::new();
     for (key, mut occurrences) in placements {
@@ -2795,9 +2991,33 @@ fn is_npc_set_list_asset(asset_path: &str) -> bool {
             .is_some_and(|name| name.starts_with("npcsetlist"))
 }
 
-fn npc_placement_logical_key(
-    row: &binary_asset::MsgpackNode,
-) -> Result<Option<NpcPlacementLogicalKey>> {
+fn record_npc_placement(
+    row: &RowFieldIndex<'_>,
+    provider_local: usize,
+    row_id: RowId,
+    placements: &mut Option<NpcPlacementMap>,
+) -> Result<()> {
+    let Some(placements) = placements else {
+        return Ok(());
+    };
+    let Some(binding) = npc_placement_binding(row)? else {
+        return Ok(());
+    };
+    let Some(key) = npc_placement_logical_key(row)? else {
+        return Ok(());
+    };
+    placements
+        .entry(key)
+        .or_default()
+        .push(NpcPlacementOccurrence {
+            provider_local,
+            row_id,
+            binding,
+        });
+    Ok(())
+}
+
+fn npc_placement_logical_key(row: &RowFieldIndex<'_>) -> Result<Option<NpcPlacementLogicalKey>> {
     let map_id = npc_integer_field(row, "m_MapID")?;
     let appear_label = npc_string_field(row, "m_AppearLabel")?;
     if let (Some(map_id), Some(appear_label)) = (map_id.filter(|value| *value > 0), appear_label) {
@@ -2809,7 +3029,7 @@ fn npc_placement_logical_key(
     Ok(npc_string_field(row, "m_label")?.map(NpcPlacementLogicalKey::Label))
 }
 
-fn npc_placement_binding(row: &binary_asset::MsgpackNode) -> Result<Option<NpcPlacementBinding>> {
+fn npc_placement_binding(row: &RowFieldIndex<'_>) -> Result<Option<NpcPlacementBinding>> {
     let Some(owner_npc) = npc_integer_field(row, "m_OwnerNPC")?.filter(|value| *value > 0) else {
         return Ok(None);
     };
@@ -2819,16 +3039,16 @@ fn npc_placement_binding(row: &binary_asset::MsgpackNode) -> Result<Option<NpcPl
     Ok(Some(NpcPlacementBinding { owner_npc, talk_id }))
 }
 
-fn npc_integer_field(row: &binary_asset::MsgpackNode, field: &str) -> Result<Option<i64>> {
+fn npc_integer_field(row: &RowFieldIndex<'_>, field: &str) -> Result<Option<i64>> {
     Ok(row
-        .map_get(field)?
+        .get(field)
         .and_then(binary_asset::MsgpackNode::integer_value)
         .and_then(IntegerValue::as_i64))
 }
 
-fn npc_string_field(row: &binary_asset::MsgpackNode, field: &str) -> Result<Option<String>> {
+fn npc_string_field(row: &RowFieldIndex<'_>, field: &str) -> Result<Option<String>> {
     Ok(row
-        .map_get(field)?
+        .get(field)
         .and_then(binary_asset::MsgpackNode::string_value)
         .map(str::trim)
         .filter(|value| !value.is_empty())
@@ -3248,7 +3468,7 @@ fn read_u64_le_at(bytes: &[u8], offset: usize) -> Option<u64> {
 fn make_atomic_variant(
     opened: &[OpenedPak],
     provider: &ParsedDbProvider,
-    row: NodeRef<'_>,
+    row: &RowFieldIndex<'_>,
     row_id: RowId,
     unit: &AtomicGroup,
     raw_sha256: String,
@@ -3261,7 +3481,7 @@ fn make_atomic_variant(
     let marker = unit
         .fields
         .iter()
-        .filter_map(|field| binary_asset::atomic_group_value(row, unit, field).ok())
+        .filter_map(|field| row.atomic_group_value(unit, field).ok())
         .map(|node| format!("{}:0x{:02X}", node.node.type_name(), node.node.marker))
         .collect::<Vec<_>>()
         .join(", ");
@@ -3269,15 +3489,13 @@ fn make_atomic_variant(
         .fields
         .iter()
         .filter_map(|field| {
-            binary_asset::atomic_group_value(row, unit, field)
-                .ok()
-                .map(|node| {
-                    let label = unit
-                        .array_index
-                        .map(|index| format!("{field}[{index}]"))
-                        .unwrap_or_else(|| field.clone());
-                    format!("{label}={}", preview_node(node.node))
-                })
+            row.atomic_group_value(unit, field).ok().map(|node| {
+                let label = unit
+                    .array_index
+                    .map(|index| format!("{field}[{index}]"))
+                    .unwrap_or_else(|| field.clone());
+                format!("{label}={}", preview_node(node.node))
+            })
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -3343,12 +3561,13 @@ fn make_atomic_variant_sets(
         };
         #[cfg(test)]
         TEST_ATOMIC_VARIANT_ROW_PARSE_CALLS.with(|calls| calls.set(calls.get() + 1));
+        let row_fields = RowFieldIndex::new(row.node_ref())?;
         for (unit, variants) in units.iter().zip(&mut variants_by_unit) {
-            let hashes = binary_asset::atomic_group_hashes(row.node_ref(), unit)?;
+            let hashes = row_fields.atomic_group_hashes(unit)?;
             variants.push(make_atomic_variant(
                 opened,
                 provider,
-                row.node_ref(),
+                &row_fields,
                 row_id,
                 unit,
                 hashes.raw_sha256,
@@ -4006,6 +4225,7 @@ fn build_merged_database(
     resolutions: &ResolutionSet,
     opened: &[OpenedPak],
     parsed: &[ParsedDbProvider],
+    profile_registry: &profiles::ProfileRegistry,
     global_carrier_index: usize,
     cancelled: Option<&CancellationToken>,
     uexp_path: &Path,
@@ -4018,11 +4238,8 @@ fn build_merged_database(
     let carrier_provider = &parsed[carrier_local];
     let carrier_asset = &carrier_provider.asset;
     let asset_path = &carrier_provider.group.base_path;
-    let mut unit_planner = profiles::AtomicUnitPlanner::new(
-        profiles::default_registry(),
-        pinned_profile_id(plan),
-        asset_path,
-    );
+    let mut unit_planner =
+        profiles::AtomicUnitPlanner::new(profile_registry, pinned_profile_id(plan), asset_path);
     let conflict_index = build_asset_conflict_index(plan, asset_path);
     let mut raw_preserved = 0_u64;
     let mut raw_replaced = 0_u64;
@@ -4101,10 +4318,15 @@ fn build_merged_database(
                         "selected whole-row input {input_id} is unavailable"
                     ))
                 })?;
-            raw_replaced += 1;
+            if donor_local == carrier_local {
+                raw_preserved += 1;
+            } else {
+                raw_replaced += 1;
+            }
             RowChoice::Whole(donor_local)
         } else {
-            let layout = unit_planner.layout_for_row(&carrier_row_for_plan.node)?;
+            let carrier_fields_for_plan = RowFieldIndex::new(carrier_row_for_plan.node_ref())?;
+            let layout = unit_planner.layout_for_field_view(carrier_fields_for_plan.fields())?;
             let mut selections = Vec::new();
             let mut selected_whole_fields = BTreeSet::new();
             let mut selected_indexed_fields: BTreeMap<String, (usize, BTreeSet<usize>)> =
@@ -4115,6 +4337,17 @@ fn build_merged_database(
                         continue;
                     }
                     let input_id = selected_input_id(conflict, resolutions)?;
+                    let donor_local = parsed
+                        .iter()
+                        .position(|provider| opened[provider.input_index].descriptor.id == input_id)
+                        .ok_or_else(|| {
+                            MergeError::InvalidResolution(format!(
+                                "the selected Pak {input_id} is not available for this field"
+                            ))
+                        })?;
+                    if donor_local == carrier_local {
+                        continue;
+                    }
                     if let Some(index) = unit.array_index {
                         let expected_len = unit.expected_array_len.ok_or_else(|| {
                             MergeError::DatabaseStructureMismatch(format!(
@@ -4136,14 +4369,6 @@ fn build_merged_database(
                     } else {
                         selected_whole_fields.extend(unit.fields.iter().cloned());
                     }
-                    let donor_local = parsed
-                        .iter()
-                        .position(|provider| opened[provider.input_index].descriptor.id == input_id)
-                        .ok_or_else(|| {
-                            MergeError::InvalidResolution(format!(
-                                "the selected Pak {input_id} is not available for this field"
-                            ))
-                        })?;
                     selections.push(AtomicDonorSelection {
                         fields: unit.fields.clone(),
                         donor_input: donor_local,
@@ -4159,7 +4384,7 @@ fn build_merged_database(
                 // Whole fields and indexed array elements are exact raw donor
                 // nodes. Untouched top-level values and unselected array
                 // elements remain exact carrier nodes.
-                let field_count = carrier_row_for_plan.node.map_fields()?.len() as u64;
+                let field_count = carrier_fields_for_plan.len() as u64;
                 let touched_fields = selected_whole_fields
                     .len()
                     .saturating_add(selected_indexed_fields.len())
@@ -4249,12 +4474,14 @@ fn build_merged_database(
     let carrier_row_count = carrier_asset.row_count();
     for (appended_index, row_id) in appended_ids.into_iter().enumerate() {
         check_cancel(cancelled)?;
-        let selected_input =
-            if let Some(conflict) = indexed_conflict(&conflict_index, row_id, "$row") {
-                Some(selected_input_id(conflict, resolutions)?.to_owned())
-            } else {
-                None
-            };
+        let selected_input = if let Some(conflict) =
+            indexed_conflict(&conflict_index, row_id, "$row")
+            && conflict.blocking
+        {
+            Some(selected_input_id(conflict, resolutions)?.to_owned())
+        } else {
+            None
+        };
         let donor_local = if let Some(input_id) = selected_input {
             parsed
                 .iter()
@@ -4375,7 +4602,16 @@ fn record_streamed_row(
     audit: &mut RawAuditAccumulator,
 ) -> Result<()> {
     let output_node = binary_asset::parse_messagepack(row_bytes)?;
-    let output_id = raw_audit_row_id(&output_node)?;
+    let output_row = NodeRef {
+        node: &output_node,
+        source: row_bytes,
+    };
+    let output_fields = RowFieldIndex::new(output_row).map_err(|error| {
+        MergeError::Verification(format!(
+            "a row has an invalid logical m_id while checking stored data: {error}"
+        ))
+    })?;
+    let output_id = raw_audit_row_id(&output_fields)?;
     if output_id != expected_id {
         return Err(MergeError::Verification(format!(
             "stored row ID mismatch for {asset_path}: expected {expected_id}, built {output_id}"
@@ -4389,11 +4625,11 @@ fn record_streamed_row(
     update_framed(&mut audit.ledger, row_sha256_hex.as_bytes());
     audit.verified_rows += 1;
 
-    let Some(carrier_row) = source_rows[carrier_local].as_ref() else {
+    if source_rows[carrier_local].is_none() {
         audit.replaced_nodes += 1;
         update_framed(&mut audit.ledger, b"appended-row");
         return Ok(());
-    };
+    }
     if let Some(whole_conflict) = indexed_conflict(conflict_index, expected_id, "__whole_row__") {
         let selected = selected_input_id(whole_conflict, resolutions)?;
         if selected == carrier_input_id {
@@ -4406,16 +4642,23 @@ fn record_streamed_row(
         return Ok(());
     }
 
-    let layout = unit_planner.layout_for_row(&carrier_row.node)?;
+    let source_fields = source_rows
+        .iter()
+        .map(|row| {
+            row.as_ref()
+                .map(|row| RowFieldIndex::new(row.node_ref()))
+                .transpose()
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let carrier_fields = source_fields[carrier_local]
+        .as_ref()
+        .expect("base Pak row field index remains available");
+    let layout = unit_planner.layout_for_field_view(carrier_fields.fields())?;
     if layout.units.is_empty() {
         audit.preserved_nodes += 1;
         update_framed(&mut audit.ledger, b"whole-row-no-profile-units");
         return Ok(());
     }
-    let output_row = NodeRef {
-        node: &output_node,
-        source: row_bytes,
-    };
     for unit in layout.units.iter() {
         let (expected_unit_hash, replaced) = expected_atomic_audit_digest(
             asset_path,
@@ -4425,10 +4668,10 @@ fn record_streamed_row(
             resolutions,
             opened,
             parsed,
-            source_rows,
+            &source_fields,
             carrier_local,
         )?;
-        let actual_unit_hash = raw_atomic_audit_digest_from_row(output_row, unit)?;
+        let actual_unit_hash = raw_atomic_audit_digest_from_fields(&output_fields, unit)?;
         if expected_unit_hash != actual_unit_hash {
             return Err(MergeError::Verification(format!(
                 "linked-value storage mismatch for {asset_path} m_id={expected_id} {}: expected {expected_unit_hash}, built {actual_unit_hash}",
@@ -4532,8 +4775,8 @@ fn finalize_raw_preservation_audits(
     Ok(finalized)
 }
 
-fn raw_audit_row_id(node: &binary_asset::MsgpackNode) -> Result<RowId> {
-    binary_asset::logical_row_id(node).map_err(|error| {
+fn raw_audit_row_id(fields: &RowFieldIndex<'_>) -> Result<RowId> {
+    fields.row_id().map_err(|error| {
         MergeError::Verification(format!(
             "a row has an invalid logical m_id while checking stored data: {error}"
         ))
@@ -4549,21 +4792,21 @@ fn expected_atomic_audit_digest(
     resolutions: &ResolutionSet,
     opened: &[OpenedPak],
     parsed: &[ParsedDbProvider],
-    source_rows: &[Option<IndexedRow<'_>>],
+    source_fields: &[Option<RowFieldIndex<'_>>],
     carrier_local: usize,
 ) -> Result<(String, bool)> {
-    let carrier_row = source_rows[carrier_local]
+    let carrier_fields = source_fields[carrier_local]
         .as_ref()
         .ok_or_else(|| MergeError::Verification(format!("base Pak row {row_id} disappeared")))?;
     let Some(conflict) = indexed_conflict(conflicts, row_id, &unit.id) else {
         return Ok((
-            raw_atomic_audit_digest_from_row(carrier_row.node_ref(), unit)?,
+            raw_atomic_audit_digest_from_fields(carrier_fields, unit)?,
             false,
         ));
     };
     if conflict.kind == ConflictKind::EncodingDrift {
         return Ok((
-            raw_atomic_audit_digest_from_row(carrier_row.node_ref(), unit)?,
+            raw_atomic_audit_digest_from_fields(carrier_fields, unit)?,
             false,
         ));
     }
@@ -4572,7 +4815,7 @@ fn expected_atomic_audit_digest(
     let carrier_input_id = &opened[parsed[carrier_local].input_index].descriptor.id;
     if selected == carrier_input_id {
         return Ok((
-            raw_atomic_audit_digest_from_row(carrier_row.node_ref(), unit)?,
+            raw_atomic_audit_digest_from_fields(carrier_fields, unit)?,
             false,
         ));
     }
@@ -4584,21 +4827,22 @@ fn expected_atomic_audit_digest(
                 "selected Pak {selected} is unavailable while checking stored data for {asset_path}"
             ))
         })?;
-    let donor_row = source_rows[donor_local].as_ref().ok_or_else(|| {
+    let donor_fields = source_fields[donor_local].as_ref().ok_or_else(|| {
         MergeError::Verification(format!(
             "selected Pak {selected} has no row {row_id} while checking stored data for {asset_path}"
         ))
     })?;
     Ok((
-        raw_atomic_audit_digest_from_row(donor_row.node_ref(), unit)?,
+        raw_atomic_audit_digest_from_fields(donor_fields, unit)?,
         true,
     ))
 }
 
-fn raw_atomic_audit_digest_from_row(row: NodeRef<'_>, unit: &AtomicGroup) -> Result<String> {
-    raw_atomic_audit_digest(unit, |field| {
-        Ok(binary_asset::atomic_group_value(row, unit, field)?.raw())
-    })
+fn raw_atomic_audit_digest_from_fields(
+    row: &RowFieldIndex<'_>,
+    unit: &AtomicGroup,
+) -> Result<String> {
+    raw_atomic_audit_digest(unit, |field| Ok(row.atomic_group_value(unit, field)?.raw()))
 }
 
 fn raw_atomic_audit_digest<'a>(
@@ -5176,6 +5420,19 @@ fn require_output_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn reject_output_input_alias(output: &Path, inputs: &[PathBuf]) -> Result<()> {
+    if let Some(input) = inputs
+        .iter()
+        .find(|input| resources::same_file_path(output, input))
+    {
+        return Err(MergeError::InvalidRequest(format!(
+            "the output file must not replace an input Pak: {}",
+            input.display()
+        )));
+    }
+    Ok(())
+}
+
 fn capture_output_target(
     path: &Path,
     overwrite_existing: bool,
@@ -5191,6 +5448,12 @@ fn capture_output_target(
             if metadata.file_type().is_symlink() || !metadata.is_file() {
                 return Err(MergeError::InvalidRequest(format!(
                     "the existing output is not a regular file and cannot be replaced: {}",
+                    path.display()
+                )));
+            }
+            if metadata.permissions().readonly() {
+                return Err(MergeError::InvalidRequest(format!(
+                    "the existing output is read-only and cannot be replaced: {}",
                     path.display()
                 )));
             }
@@ -5384,6 +5647,7 @@ where
         .prefix(".pak-merger-install-")
         .suffix(".partial")
         .tempfile_in(output_parent)?;
+    let _install_journal = resources::register_install_sidecar(sidecar.path())?;
     let mut reader = File::open(partial)?;
     let mut buffer = vec![0_u8; OUTPUT_COPY_BUFFER_BYTES];
     let mut digest = Sha256::new();
@@ -5480,13 +5744,26 @@ fn ensure_output_disk_space(
     mount_point: &str,
     entries: &[(String, u64)],
     compression: OutputCompression,
+    input_decode_temp_sizes: &[u64],
+    cancellation: Option<&CancellationToken>,
 ) -> Result<()> {
     let parent = output
         .parent()
         .ok_or_else(|| MergeError::InvalidRequest("output has no parent".to_owned()))?;
     let allocation_unit = fs2::allocation_granularity(parent)?.max(1);
-    let required =
-        estimated_output_additional_bytes(mount_point, entries, compression, allocation_unit)?;
+    let mut required = estimated_output_additional_bytes(
+        mount_point,
+        entries,
+        compression,
+        allocation_unit,
+        cancellation,
+    )?;
+    for size in input_decode_temp_sizes {
+        required = checked_estimate_add(required, round_up_estimate(*size, allocation_unit)?)?;
+    }
+    if let Some(headroom) = maximum_input_decode_headroom(input_decode_temp_sizes) {
+        required = checked_estimate_add(required, headroom)?;
+    }
     let available = fs2::available_space(parent)?;
     if available < required {
         return Err(MergeError::InvalidRequest(format!(
@@ -5494,6 +5771,13 @@ fn ensure_output_disk_space(
         )));
     }
     Ok(())
+}
+
+fn maximum_input_decode_headroom(input_decode_temp_sizes: &[u64]) -> Option<u64> {
+    input_decode_temp_sizes
+        .iter()
+        .map(|size| (size / 20).max(pak::MINIMUM_DECODE_DISK_HEADROOM_BYTES))
+        .max()
 }
 
 #[cfg(test)]
@@ -5537,19 +5821,48 @@ fn estimated_output_additional_bytes(
     entries: &[(String, u64)],
     compression: OutputCompression,
     allocation_unit: u64,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<u64> {
     let oodle_bounds = if compression == OutputCompression::Oodle {
-        pak::oodle_output_block_bounds(&required_oodle_block_sizes(entries)?)?
+        pak::oodle_output_block_bounds(&required_oodle_block_sizes(entries)?, cancellation)?
     } else {
         BTreeMap::new()
     };
-    estimated_output_additional_bytes_with_bounds_and_allocation(
-        mount_point,
-        entries,
-        compression,
-        &oodle_bounds,
-        allocation_unit,
-        allocation_unit,
+    Ok(
+        estimated_output_space_components_with_bounds_and_allocation(
+            mount_point,
+            entries,
+            compression,
+            &oodle_bounds,
+            allocation_unit,
+            allocation_unit,
+        )?
+        .1,
+    )
+}
+
+fn estimated_pak_file_upper_bound(
+    mount_point: &str,
+    entries: &[(String, u64)],
+    compression: OutputCompression,
+    allocation_unit: u64,
+    cancellation: Option<&CancellationToken>,
+) -> Result<u64> {
+    let oodle_bounds = if compression == OutputCompression::Oodle {
+        pak::oodle_output_block_bounds(&required_oodle_block_sizes(entries)?, cancellation)?
+    } else {
+        BTreeMap::new()
+    };
+    Ok(
+        estimated_output_space_components_with_bounds_and_allocation(
+            mount_point,
+            entries,
+            compression,
+            &oodle_bounds,
+            allocation_unit,
+            0,
+        )?
+        .0,
     )
 }
 
@@ -5601,6 +5914,7 @@ fn round_up_estimate(value: u64, unit: u64) -> Result<u64> {
     }
 }
 
+#[cfg(test)]
 fn estimated_output_additional_bytes_with_bounds_and_allocation(
     mount_point: &str,
     entries: &[(String, u64)],
@@ -5609,6 +5923,27 @@ fn estimated_output_additional_bytes_with_bounds_and_allocation(
     allocation_unit: u64,
     temporary_file_metadata_bytes: u64,
 ) -> Result<u64> {
+    Ok(
+        estimated_output_space_components_with_bounds_and_allocation(
+            mount_point,
+            entries,
+            compression,
+            oodle_bounds,
+            allocation_unit,
+            temporary_file_metadata_bytes,
+        )?
+        .1,
+    )
+}
+
+fn estimated_output_space_components_with_bounds_and_allocation(
+    mount_point: &str,
+    entries: &[(String, u64)],
+    compression: OutputCompression,
+    oodle_bounds: &BTreeMap<u64, u64>,
+    allocation_unit: u64,
+    temporary_file_metadata_bytes: u64,
+) -> Result<(u64, u64)> {
     let mut data_bytes = 0_u64;
     let mut encoded_index_bytes = 0_u64;
     for (_, logical_size) in entries {
@@ -5693,8 +6028,8 @@ fn estimated_output_additional_bytes_with_bounds_and_allocation(
     // Strict verification retains a decoded copy only for compressed entries.
     // Staged database files are deliberately absent here: they already occupy
     // this volume and are reflected in `available_space` at the call site.
-    match compression {
-        OutputCompression::None => Ok(pak_upper_bound),
+    let total = match compression {
+        OutputCompression::None => pak_upper_bound,
         OutputCompression::Oodle => {
             let verification_temp_bytes =
                 entries.iter().try_fold(0_u64, |total, (_, logical_size)| {
@@ -5706,9 +6041,10 @@ fn estimated_output_additional_bytes_with_bounds_and_allocation(
                         checked_estimate_add(allocated, temporary_file_metadata_bytes)?;
                     checked_estimate_add(total, with_metadata)
                 })?;
-            checked_estimate_add(pak_upper_bound, verification_temp_bytes)
+            checked_estimate_add(pak_upper_bound, verification_temp_bytes)?
         }
-    }
+    };
+    Ok((pak_upper_bound, total))
 }
 
 fn pak_string_serialized_size(value: &str) -> Result<u64> {
@@ -5778,7 +6114,14 @@ fn build_report_conflict_records(
                     .variants
                     .iter()
                     .find(|variant| variant.input_id == carrier_input_id)
-                    .or_else(|| conflict.variants.first())
+                    .or_else(|| {
+                        plan.inputs.iter().find_map(|input| {
+                            conflict
+                                .variants
+                                .iter()
+                                .find(|variant| variant.input_id == input.id)
+                        })
+                    })
                     .map(|variant| variant.id.as_str())
             } else {
                 None
@@ -5815,12 +6158,11 @@ fn update_framed(digest: &mut Sha256, bytes: &[u8]) {
 }
 
 fn sort_key(value: &str) -> String {
-    value.replace('\\', "/").to_ascii_lowercase()
+    value.replace('\\', "/").to_lowercase()
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
+    resources::same_file_path(left, right)
 }
 
 #[cfg(test)]
@@ -5854,6 +6196,40 @@ mod tests {
                 component: ".uexp"
             } if package == "Game/Data/Table"
         ));
+    }
+
+    #[test]
+    fn output_cannot_alias_an_input_pak() {
+        let root = tempfile::tempdir().unwrap();
+        let input = root.path().join("Input_P.pak");
+        let alias = root.path().join("Alias_P.pak");
+        fs::write(&input, b"input").unwrap();
+        fs::hard_link(&input, &alias).unwrap();
+
+        let error = reject_output_input_alias(&alias, std::slice::from_ref(&input)).unwrap_err();
+
+        assert!(error.to_string().contains("must not replace an input Pak"));
+        assert_eq!(fs::read(input).unwrap(), b"input");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    #[allow(clippy::permissions_set_readonly_false)]
+    fn read_only_output_is_rejected_before_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let output = root.path().join("Result_P.pak");
+        fs::write(&output, b"keep").unwrap();
+        let mut permissions = fs::metadata(&output).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&output, permissions).unwrap();
+
+        let error = capture_output_target(&output, true).unwrap_err();
+
+        assert!(error.to_string().contains("read-only"));
+        assert_eq!(fs::read(&output).unwrap(), b"keep");
+        let mut permissions = fs::metadata(&output).unwrap().permissions();
+        permissions.set_readonly(false);
+        fs::set_permissions(&output, permissions).unwrap();
     }
 
     #[cfg(windows)]
@@ -6035,6 +6411,22 @@ mod tests {
         // Three input Paks may each contain this same complete database. The
         // preflight is based on the one selected output entry, not 3x input.
         assert!(uncompressed < logical_bytes * 2);
+    }
+
+    #[test]
+    fn input_decode_preflight_keeps_the_largest_per_entry_headroom() {
+        let one_gib = 1024_u64 * 1024 * 1024;
+        let twenty_gib = 20 * one_gib;
+
+        assert_eq!(
+            maximum_input_decode_headroom(&[one_gib]),
+            Some(pak::MINIMUM_DECODE_DISK_HEADROOM_BYTES)
+        );
+        assert_eq!(
+            maximum_input_decode_headroom(&[one_gib, twenty_gib]),
+            Some(twenty_gib / 20)
+        );
+        assert_eq!(maximum_input_decode_headroom(&[]), None);
     }
 
     #[test]
@@ -6280,6 +6672,14 @@ mod tests {
     }
 
     #[test]
+    fn outer_analysis_workers_disable_inner_decode_parallelism() {
+        assert!(inner_decode_multithreaded(true, false));
+        assert!(!inner_decode_multithreaded(true, true));
+        assert!(!inner_decode_multithreaded(false, false));
+        assert!(!inner_decode_multithreaded(false, true));
+    }
+
+    #[test]
     fn partitioned_analysis_keeps_error_selection_in_original_unit_order() {
         let mut completed = Vec::new();
         let error = analyze_partitioned_units(
@@ -6360,6 +6760,17 @@ mod tests {
         output.extend_from_slice(x);
         output.extend(fixstr("y"));
         output.extend_from_slice(y);
+        output
+    }
+
+    fn external_profile_skill_row(id: u8, types: [u8; 2], values: [u8; 2]) -> Vec<u8> {
+        let mut output = vec![0x83];
+        output.extend(fixstr("m_id"));
+        output.push(id);
+        output.extend(fixstr("m_Types"));
+        output.extend([0x92, types[0], types[1]]);
+        output.extend(fixstr("m_Values"));
+        output.extend([0x92, values[0], values[1]]);
         output
     }
 
@@ -6701,15 +7112,49 @@ mod tests {
     fn parallel_condition_row(id: u8, conditions: &[u8], params: &[u8]) -> Vec<u8> {
         assert!(conditions.len() <= 15);
         assert!(params.len() <= 15);
-        let mut row = vec![0x83];
+        assert_eq!(conditions.len(), params.len());
+        // TacticalActionList is an audited profile: keep every declared group
+        // present so this fixture exercises indexed condition coupling instead
+        // of the fail-closed whole-package fallback for an incomplete schema.
+        let mut row = vec![0xde, 0, 17];
         row.extend(fixstr("m_id"));
         row.push(id);
-        row.extend(fixstr("m_Conditions"));
-        row.push(0x90 | conditions.len() as u8);
-        row.extend_from_slice(conditions);
-        row.extend(fixstr("m_Params"));
-        row.push(0x90 | params.len() as u8);
-        row.extend_from_slice(params);
+        for field in [
+            "m_UseSkills",
+            "m_Tactics",
+            "m_TacticalList",
+            "m_SkillIndex",
+            "m_FriendlyIndex",
+        ] {
+            row.extend(fixstr(field));
+            row.push(0x90);
+        }
+        for (field, value) in [
+            ("m_Presage", 0xc2),
+            ("m_PresageSkillID", 0),
+            ("m_OnEventFlgIndex", 0),
+            ("m_OffEventFlgIndex", 0),
+        ] {
+            row.extend(fixstr(field));
+            row.push(value);
+        }
+        for (field, values) in [("m_Conditions", conditions), ("m_Params", params)] {
+            row.extend(fixstr(field));
+            row.push(0x90 | values.len() as u8);
+            row.extend_from_slice(values);
+        }
+        let zeros = vec![0; conditions.len()];
+        for field in [
+            "m_AilmentTypes",
+            "m_StatusTypes",
+            "m_WeaponTypes",
+            "m_MagicTypes",
+            "m_Equipment",
+        ] {
+            row.extend(fixstr(field));
+            row.push(0x90 | zeros.len() as u8);
+            row.extend_from_slice(&zeros);
+        }
         row
     }
 
@@ -7017,6 +7462,129 @@ mod tests {
     }
 
     #[test]
+    fn parent_only_mount_rebases_against_a_named_content_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let broad = temp.path().join("Broad_P.pak");
+        let named = temp.path().join("Named_P.pak");
+        write_versioned_test_pak(
+            &broad,
+            repak::Version::V11,
+            "../../../",
+            [(
+                "Example/Content/Loose/Shared.bin".to_owned(),
+                b"broad".to_vec(),
+            )],
+        );
+        write_versioned_test_pak(
+            &named,
+            repak::Version::V3,
+            "../../../Example/Content/",
+            [("Loose/Shared.bin".to_owned(), b"named".to_vec())],
+        );
+
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![broad.clone(), named],
+            carrier_path: broad,
+        })
+        .unwrap();
+
+        assert_eq!(plan.assets.len(), 1);
+        assert_eq!(
+            plan.assets[0].virtual_path,
+            "Example/Content/Loose/Shared.bin"
+        );
+        assert_eq!(plan.conflicts.len(), 1);
+        assert_eq!(plan.conflicts[0].kind, ConflictKind::OpaquePackage);
+    }
+
+    #[test]
+    fn parent_only_mount_does_not_bridge_unrelated_named_game_roots() {
+        let temp = tempfile::tempdir().unwrap();
+        let broad = temp.path().join("Broad_P.pak");
+        let first = temp.path().join("First_P.pak");
+        let second = temp.path().join("Second_P.pak");
+        write_versioned_test_pak(
+            &broad,
+            repak::Version::V11,
+            "../../../",
+            [("Shared/Loose.bin".to_owned(), b"broad".to_vec())],
+        );
+        write_versioned_test_pak(
+            &first,
+            repak::Version::V11,
+            "../../../FirstGame/Content/",
+            [("Loose/First.bin".to_owned(), b"first".to_vec())],
+        );
+        write_versioned_test_pak(
+            &second,
+            repak::Version::V11,
+            "../../../SecondGame/Content/",
+            [("Loose/Second.bin".to_owned(), b"second".to_vec())],
+        );
+
+        let error = analyze(AnalysisRequest {
+            pak_paths: vec![broad.clone(), first, second],
+            carrier_path: broad,
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("point to different game folders"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn extensionless_file_and_package_with_the_same_stem_are_both_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let package = temp.path().join("Package_P.pak");
+        let loose = temp.path().join("Loose_P.pak");
+        let mount = "../../../";
+        pak::write_pak_v11(
+            &package,
+            mount,
+            [pak::PakWriteEntry::new(
+                "Shared/X.uasset",
+                b"header".to_vec(),
+            )],
+        )
+        .unwrap();
+        pak::write_pak_v11(
+            &loose,
+            mount,
+            [pak::PakWriteEntry::new("Shared/X", b"loose".to_vec())],
+        )
+        .unwrap();
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![package.clone(), loose],
+            carrier_path: package,
+        })
+        .unwrap();
+        assert_eq!(plan.assets.len(), 2);
+        assert!(plan.conflicts.is_empty());
+
+        let output = temp.path().join("Both_P.pak");
+        write(
+            resolve(
+                plan.clone(),
+                ResolutionSet {
+                    plan_id: plan.plan_id,
+                    ..ResolutionSet::default()
+                },
+            )
+            .unwrap(),
+            &output,
+        )
+        .unwrap();
+
+        let merged = PakArchive::open(&output).unwrap();
+        assert_eq!(merged.read_entry("Shared/X.uasset").unwrap(), b"header");
+        assert_eq!(merged.read_entry("Shared/X").unwrap(), b"loose");
+    }
+
+    #[test]
     fn mount_that_escapes_after_named_component_is_rejected() {
         let temp = tempfile::tempdir().unwrap();
         let first = temp.path().join("First_P.pak");
@@ -7270,7 +7838,28 @@ mod tests {
                 pak_paths: vec![PathBuf::from("a.pak")],
                 carrier_path: PathBuf::from("missing-carrier.pak"),
             },
-            inputs: Vec::new(),
+            inputs: vec![
+                InputDescriptor {
+                    id: "input-b".to_owned(),
+                    path: PathBuf::from("b.pak"),
+                    display_name: "B".to_owned(),
+                    sha256: "bb".repeat(32),
+                    size: 1,
+                    pak_version: Some(11),
+                    mount_point: Some("../../../Game/Content/".to_owned()),
+                    entry_count: Some(1),
+                },
+                InputDescriptor {
+                    id: "input-a".to_owned(),
+                    path: PathBuf::from("a.pak"),
+                    display_name: "A".to_owned(),
+                    sha256: "aa".repeat(32),
+                    size: 1,
+                    pak_version: Some(11),
+                    mount_point: Some("../../../Game/Content/".to_owned()),
+                    entry_count: Some(1),
+                },
+            ],
             carrier_input_id: "missing-carrier".to_owned(),
             assets: Vec::new(),
             conflicts: vec![conflict],
@@ -7290,7 +7879,7 @@ mod tests {
                 .selected_variant
                 .as_ref()
                 .map(|variant| variant.id.as_str()),
-            Some("variant-a")
+            Some("variant-b")
         );
     }
 
@@ -7339,6 +7928,7 @@ mod tests {
         TEST_WHOLE_ROW_VARIANT_BUILD_CALLS.with(|calls| calls.set(0));
         TEST_ATOMIC_VARIANT_BUILD_CALLS.with(|calls| calls.set(0));
         TEST_ATOMIC_VARIANT_ROW_PARSE_CALLS.with(|calls| calls.set(0));
+        binary_asset::reset_test_row_field_index_builds();
         let session = analyze_test_paks_with_threads(vec![pak_a.clone(), pak_b], pak_a, false);
 
         for field in ["field:x", "field:y"] {
@@ -7354,6 +7944,53 @@ mod tests {
         // Both conflicting fields are materialized in one row parse per Pak,
         // rather than one full MessagePack row parse per field and Pak.
         TEST_ATOMIC_VARIANT_ROW_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 2));
+        // Main comparison and conflict materialization each build exactly one
+        // validated field index per provider row, regardless of unit count.
+        assert_eq!(binary_asset::test_row_field_index_builds(), 4);
+    }
+
+    #[test]
+    fn audited_database_with_no_observed_profile_group_falls_back_to_whole_package() {
+        let temp = tempfile::tempdir().unwrap();
+        let pak_a = temp.path().join("SchemaDriftA_P.pak");
+        let pak_b = temp.path().join("SchemaDriftB_P.pak");
+        let base = "Local/DataBase/Skill/SkillID";
+        let uasset = format!("{base}.uasset");
+        let uexp = format!("{base}.uexp");
+        for (path, x) in [(&pak_a, 10_u8), (&pak_b, 11_u8)] {
+            let bytes = test_asset(test_row(1, x, 20));
+            pak::write_pak_v11(
+                path,
+                "../../../Octopath_Traveler0/Content/",
+                [
+                    pak::PakWriteEntry::new(&uasset, uasset_with_serial_size(base, bytes.len())),
+                    pak::PakWriteEntry::new(&uexp, bytes),
+                ],
+            )
+            .unwrap();
+        }
+
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![pak_a.clone(), pak_b],
+            carrier_path: pak_a,
+        })
+        .unwrap();
+
+        assert_eq!(plan.selected_profile_id.as_deref(), Some(OT0_PROFILE_ID));
+        assert_eq!(
+            plan.assets
+                .iter()
+                .find(|asset| asset.virtual_path == base)
+                .unwrap()
+                .action,
+            AssetActionKind::SelectOpaque
+        );
+        assert!(plan.conflicts.iter().any(|conflict| {
+            conflict.asset_path == base && conflict.kind == ConflictKind::OpaquePackage
+        }));
+        assert!(plan.warnings.iter().any(|warning| {
+            warning.contains("boost_skill_chain") && warning.contains("schema drift")
+        }));
     }
 
     #[test]
@@ -7890,6 +8527,33 @@ mod tests {
         assert_eq!(merged.rows().unwrap().len(), 2);
         assert_eq!(merged.row(10).unwrap().unwrap().node_ref().raw(), row_a);
         assert_eq!(merged.row(20).unwrap().unwrap().node_ref().raw(), row_b);
+    }
+
+    #[test]
+    fn npc_placement_first_pass_reuses_compact_tuples_without_reparsing_all_rows() {
+        let temp = tempfile::tempdir().unwrap();
+        let pak_a = temp.path().join("PlacementPassA_P.pak");
+        let pak_b = temp.path().join("PlacementPassB_P.pak");
+        write_npc_set_test_pak(
+            &pak_a,
+            vec![npc_placement_row(10, 7, "SLOT_A", "First", 30, 40)],
+        );
+        write_npc_set_test_pak(
+            &pak_b,
+            vec![npc_placement_row(20, 8, "SLOT_B", "Second", 31, 41)],
+        );
+
+        TEST_INDEXED_ROW_PARSE_CALLS.with(|calls| calls.set(0));
+        let session = analyze_test_paks_with_threads(vec![pak_a.clone(), pak_b], pak_a, false);
+
+        assert!(
+            session
+                .plan()
+                .conflicts
+                .iter()
+                .all(|conflict| { conflict.kind != ConflictKind::PotentialPlacementCollision })
+        );
+        TEST_INDEXED_ROW_PARSE_CALLS.with(|calls| assert_eq!(calls.get(), 2));
     }
 
     #[test]
@@ -8514,8 +9178,8 @@ mod tests {
             "final progress must represent either an atomic install or a cross-volume byte copy"
         );
         assert!(report.verification_passed);
-        assert_eq!(report.raw_preserved_nodes, 1);
-        assert_eq!(report.raw_replaced_nodes, 2);
+        assert_eq!(report.raw_preserved_nodes, 2);
+        assert_eq!(report.raw_replaced_nodes, 1);
         assert_eq!(report.raw_preservation_audits.len(), 1);
         let audit = &report.raw_preservation_audits[0];
         assert!(audit.passed);
@@ -8745,7 +9409,7 @@ mod tests {
         let base = "Octopath_Traveler0/Content/Local/DataBase/AIBattle/TacticalActionList";
         let uasset = format!("{base}.uasset");
         let uexp = format!("{base}.uexp");
-        let mount = "../../../Example/Content/";
+        let mount = "../../../";
         for (path, conditions, params) in [(&pak_a, [1, 0], [10, 0]), (&pak_b, [0, 2], [0, 20])] {
             let uexp_bytes = test_asset(parallel_condition_row(1, &conditions, &params));
             pak::write_pak_v11(
@@ -8826,11 +9490,13 @@ mod tests {
         let output = temp.path().join("ArrayMerged_P.pak");
         let report = write(resolve(plan, resolutions).unwrap(), &output).unwrap();
         assert!(report.verification_passed);
-        assert_eq!(report.raw_replaced_nodes, 4);
+        // Selecting one audited condition slot replaces that index across all
+        // seven coupled arrays, even though it is one logical atomic unit.
+        assert_eq!(report.raw_replaced_nodes, 7);
         let audit = report.raw_preservation_audits.first().unwrap();
         assert_eq!(audit.verified_row_count, 1);
-        assert_eq!(audit.verified_atomic_unit_count, 2);
-        assert_eq!(audit.preserved_node_count, 1);
+        assert_eq!(audit.verified_atomic_unit_count, 7);
+        assert_eq!(audit.preserved_node_count, 6);
         assert_eq!(audit.replaced_node_count, 1);
         let archive = PakArchive::open(&output).unwrap();
         let merged = BinaryAsset::parse(&archive.read_entry(&uexp).unwrap()).unwrap();
@@ -8897,6 +9563,104 @@ mod tests {
     }
 
     #[test]
+    fn external_profile_registry_drives_session_analysis_and_write_end_to_end() {
+        let temp = tempfile::tempdir().unwrap();
+        let pak_a = temp.path().join("ExternalProfileA_P.pak");
+        let pak_b = temp.path().join("ExternalProfileB_P.pak");
+        let base = "Database/Skills";
+        let uasset = format!("{base}.uasset");
+        let uexp = format!("{base}.uexp");
+        let mount = "../../../ExampleGame/Content/";
+        let uexp_a = test_asset(external_profile_skill_row(1, [1, 2], [10, 20]));
+        let uexp_b = test_asset(external_profile_skill_row(1, [1, 3], [10, 30]));
+        for (path, payload) in [(&pak_a, uexp_a), (&pak_b, uexp_b)] {
+            pak::write_pak_v11(
+                path,
+                mount,
+                [
+                    pak::PakWriteEntry::new(&uasset, uasset_with_serial_size(base, payload.len())),
+                    pak::PakWriteEntry::new(&uexp, payload),
+                ],
+            )
+            .unwrap();
+        }
+
+        let profile = profiles::parse_external_profile_json(include_bytes!(
+            "../profiles/example-game.profile.json"
+        ))
+        .unwrap();
+        let mut registry = profiles::ProfileRegistry::empty();
+        registry.register(profile).unwrap();
+        let session = analyze_session_with_registry(
+            AnalysisRequest {
+                pak_paths: vec![pak_a.clone(), pak_b.clone()],
+                carrier_path: pak_a,
+            },
+            Arc::new(registry),
+        )
+        .unwrap();
+        assert_eq!(
+            session.plan().selected_profile_id.as_deref(),
+            Some("example_game")
+        );
+        let blocking = session
+            .plan()
+            .conflicts
+            .iter()
+            .filter(|conflict| conflict.blocking)
+            .collect::<Vec<_>>();
+        assert_eq!(blocking.len(), 1);
+        let conflict = blocking[0];
+        assert_eq!(conflict.kind, ConflictKind::AtomicGroup);
+        assert_eq!(conflict.group_id.as_deref(), Some("group:damage_slots[1]"));
+
+        let donor_id = session
+            .plan()
+            .inputs
+            .iter()
+            .find(|input| input.path == pak_b)
+            .unwrap()
+            .id
+            .clone();
+        let donor_variant = conflict
+            .variants
+            .iter()
+            .find(|variant| variant.input_id == donor_id)
+            .unwrap();
+        let resolutions = ResolutionSet {
+            plan_id: session.plan().plan_id.clone(),
+            choices: BTreeMap::from([(conflict.id.clone(), donor_variant.id.clone())]),
+        };
+        let output = temp.path().join("ExternalProfileMerged_P.pak");
+        let report = write_session_with_options_and_progress(
+            &session,
+            resolutions,
+            &output,
+            WriteOptions::default(),
+            |_| {},
+        )
+        .unwrap();
+        assert!(report.verification_passed);
+
+        let archive = PakArchive::open(&output).unwrap();
+        let merged = BinaryAsset::parse(&archive.read_entry(&uexp).unwrap()).unwrap();
+        let row = merged.row(1).unwrap().unwrap();
+        let values = |field| {
+            row.node
+                .map_get(field)
+                .unwrap()
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|value| value.integer_value().unwrap().as_i64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values("m_Types"), [1, 3]);
+        assert_eq!(values("m_Values"), [10, 30]);
+    }
+
+    #[test]
     fn parallel_array_length_change_fails_closed_as_whole_row_structure_conflict() {
         let temp = tempfile::tempdir().unwrap();
         let pak_a = temp.path().join("ArrayShapeA_P.pak");
@@ -8911,7 +9675,7 @@ mod tests {
             let uexp_bytes = test_asset(parallel_condition_row(1, &conditions, &params));
             pak::write_pak_v11(
                 path,
-                "../../../Example/Content/",
+                "../../../",
                 [
                     pak::PakWriteEntry::new(
                         &uasset,

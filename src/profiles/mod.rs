@@ -24,6 +24,8 @@ const MAX_ROOT_SCOPE_MATCHERS: usize = 8;
 const MAX_ASSET_RULES: usize = 512;
 const MAX_MATCHERS_PER_ASSET: usize = 8;
 const MAX_GROUPS_PER_ASSET: usize = 128;
+const PROFILE_GROUP_OBSERVATION_BITS: usize = u128::BITS as usize;
+const _: () = assert!(MAX_GROUPS_PER_ASSET <= PROFILE_GROUP_OBSERVATION_BITS);
 const MAX_FIELDS_PER_GROUP: usize = 64;
 const MAX_VIRTUAL_PATH_PATTERN_BYTES: usize = 512;
 pub const MAX_ASSET_RULE_PRIORITY: u16 = 1_000;
@@ -110,11 +112,29 @@ impl PathMatcher {
     fn matches_normalized(&self, asset_path: &str) -> bool {
         match self.kind {
             PathMatchKind::Exact => asset_path == self.value,
-            PathMatchKind::Prefix => asset_path.starts_with(&self.value),
+            PathMatchKind::Prefix => {
+                asset_path.starts_with(&self.value)
+                    || prefix_matches_after_leading_unreal_parents(asset_path, &self.value)
+            }
             PathMatchKind::Suffix => asset_path.ends_with(&self.value),
             PathMatchKind::Contains => asset_path.contains(&self.value),
         }
     }
+}
+
+fn prefix_matches_after_leading_unreal_parents(path: &str, prefix: &str) -> bool {
+    let Some(mut remainder) = path.strip_prefix('/') else {
+        return false;
+    };
+    let mut stripped_parent = false;
+    while let Some(next) = remainder.strip_prefix("../") {
+        remainder = next;
+        stripped_parent = true;
+    }
+    stripped_parent
+        && prefix
+            .strip_prefix('/')
+            .is_some_and(|prefix| remainder.starts_with(prefix))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -238,6 +258,7 @@ pub struct AtomicUnitPlanner<'a> {
     normalized_asset_path: String,
     profile: &'a AssetProfile,
     selection: AssetProfileSelectionKind,
+    observed_profile_groups: u128,
     layouts_by_hash: HashMap<u64, Vec<CachedAtomicUnitLayout>>,
     cached_layout_count: usize,
 }
@@ -255,6 +276,7 @@ impl<'a> AtomicUnitPlanner<'a> {
             normalized_asset_path,
             profile: resolved.profile,
             selection: resolved.selection,
+            observed_profile_groups: 0,
             layouts_by_hash: HashMap::new(),
             cached_layout_count: 0,
         }
@@ -276,10 +298,45 @@ impl<'a> AtomicUnitPlanner<'a> {
         self.cached_layout_count
     }
 
+    /// Records strict-profile group presence without building or caching a
+    /// layout. This is used for rows that cannot participate in field-level
+    /// comparison but still contribute to asset-wide schema observation.
+    pub fn observe_field_view(&mut self, fields: &[(&str, &MsgpackNode)]) -> Result<()> {
+        self.observe_profile_groups(fields)
+    }
+
+    /// Fails closed when an audited or declared group was never fully present
+    /// in any row observed for this asset. Per-row complete omission is valid;
+    /// partial presence is rejected immediately by `observe_profile_groups`.
+    pub fn validate_complete_profile_observation(&self) -> Result<()> {
+        if !is_strict_profile(self.profile) {
+            return Ok(());
+        }
+        for (index, rule) in self.profile.groups.iter().enumerate() {
+            debug_assert!(index < PROFILE_GROUP_OBSERVATION_BITS);
+            if self.observed_profile_groups & (1_u128 << index) == 0 {
+                return Err(BinaryAssetError::MissingField(format!(
+                    "profile group {} was never fully observed in any row of {} (schema drift)",
+                    rule.id, self.normalized_asset_path
+                )));
+            }
+        }
+        Ok(())
+    }
+
     pub fn layout_for_row(&mut self, row: &MsgpackNode) -> Result<Arc<AtomicUnitLayout>> {
         let fields = row.map_fields()?;
-        let structure_hash = hash_row_field_layout(fields.as_slice());
-        self.layout_for_fields(fields.as_slice(), structure_hash)
+        self.layout_for_field_view(fields.as_slice())
+    }
+
+    /// Reuses a caller's already validated row-field view. This keeps atomic
+    /// layout planning and repeated unit hashing on one map validation pass.
+    pub fn layout_for_field_view(
+        &mut self,
+        fields: &[(&str, &MsgpackNode)],
+    ) -> Result<Arc<AtomicUnitLayout>> {
+        let structure_hash = hash_row_field_layout(fields);
+        self.layout_for_fields(fields, structure_hash)
     }
 
     /// Checks field order before building groups. A row with a different shape
@@ -290,17 +347,25 @@ impl<'a> AtomicUnitPlanner<'a> {
         expected_field_order: &[String],
     ) -> Result<Option<Arc<AtomicUnitLayout>>> {
         let fields = row.map_fields()?;
+        self.layout_for_field_view_matching_field_order(fields.as_slice(), expected_field_order)
+    }
+
+    pub fn layout_for_field_view_matching_field_order(
+        &mut self,
+        fields: &[(&str, &MsgpackNode)],
+        expected_field_order: &[String],
+    ) -> Result<Option<Arc<AtomicUnitLayout>>> {
         let matches = fields.len() == expected_field_order.len()
             && fields
                 .iter()
                 .zip(expected_field_order)
                 .all(|((name, _), expected)| *name == expected);
         if !matches {
+            self.observe_profile_groups(fields)?;
             return Ok(None);
         }
-        let structure_hash = hash_row_field_layout(fields.as_slice());
-        self.layout_for_fields(fields.as_slice(), structure_hash)
-            .map(Some)
+        let structure_hash = hash_row_field_layout(fields);
+        self.layout_for_fields(fields, structure_hash).map(Some)
     }
 
     fn layout_for_fields(
@@ -308,6 +373,9 @@ impl<'a> AtomicUnitPlanner<'a> {
         fields: &[(&str, &MsgpackNode)],
         structure_hash: u64,
     ) -> Result<Arc<AtomicUnitLayout>> {
+        // Observe before the cache lookup: every provider row must be checked,
+        // including rows that reuse an already planned layout.
+        self.observe_profile_groups(fields)?;
         if let Some(cached) = self
             .layouts_by_hash
             .get(&structure_hash)
@@ -350,6 +418,29 @@ impl<'a> AtomicUnitPlanner<'a> {
         }
 
         Ok(layout)
+    }
+
+    fn observe_profile_groups(&mut self, fields: &[(&str, &MsgpackNode)]) -> Result<()> {
+        if !is_strict_profile(self.profile) {
+            return Ok(());
+        }
+        let field_names: BTreeSet<&str> = fields.iter().map(|(name, _)| *name).collect();
+        for (index, rule) in self.profile.groups.iter().enumerate() {
+            debug_assert!(index < PROFILE_GROUP_OBSERVATION_BITS);
+            let present_count = rule
+                .fields
+                .iter()
+                .filter(|name| field_names.contains(name.as_str()))
+                .count();
+            if present_count == 0 {
+                continue;
+            }
+            if present_count != rule.fields.len() {
+                return Err(missing_profile_group_fields(rule, &field_names));
+            }
+            self.observed_profile_groups |= 1_u128 << index;
+        }
+        Ok(())
     }
 }
 
@@ -613,6 +704,9 @@ fn atomic_units_for_fields(
         if present.is_empty() {
             continue;
         }
+        if present.len() != rule.fields.len() && is_strict_profile(profile) {
+            return Err(missing_profile_group_fields(rule, &field_names));
+        }
         for field in &present {
             if field == "m_id" || !consumed.insert(field.clone()) {
                 return Err(BinaryAssetError::OverlappingFieldSelection(field.clone()));
@@ -679,6 +773,27 @@ fn atomic_units_for_fields(
         });
     }
     Ok(units)
+}
+
+fn is_strict_profile(profile: &AssetProfile) -> bool {
+    matches!(
+        profile.precision,
+        ProfilePrecision::Audited | ProfilePrecision::Declared
+    )
+}
+
+fn missing_profile_group_fields(
+    rule: &AtomicGroupRule,
+    field_names: &BTreeSet<&str>,
+) -> BinaryAssetError {
+    let missing = rule
+        .fields
+        .iter()
+        .filter(|name| !field_names.contains(name.as_str()))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    BinaryAssetError::MissingField(format!("profile group {} ({missing})", rule.id))
 }
 
 fn hash_row_field_layout(fields: &[(&str, &MsgpackNode)]) -> u64 {
@@ -981,6 +1096,41 @@ mod tests {
         out
     }
 
+    fn single_group_registry(precision: ProfilePrecision) -> ProfileRegistry {
+        let game = GameProfile {
+            id: "observation_test".to_owned(),
+            display_name: "Observation Test".to_owned(),
+            format: ProfileFormat::MessagePackMDataListV1,
+            origin: ProfileOrigin::BuiltIn,
+            detection_matchers: vec![PathMatcher::builtin(
+                PathMatchKind::Contains,
+                "/example/content/",
+            )],
+            minimum_detection_matches: 1,
+            root_scope_matchers: Vec::new(),
+            assets: vec![AssetProfileRule {
+                matchers: vec![PathMatcher::builtin(
+                    PathMatchKind::Suffix,
+                    "/database/table",
+                )],
+                priority: 1,
+                profile: AssetProfile {
+                    id: "observed_table".to_owned(),
+                    precision,
+                    groups: vec![AtomicGroupRule {
+                        id: "linked_pair".to_owned(),
+                        fields: vec!["m_Left".to_owned(), "m_Right".to_owned()],
+                        force_compound: true,
+                        index_coupled: false,
+                    }],
+                },
+            }],
+        };
+        let mut registry = ProfileRegistry::empty();
+        registry.register(game).unwrap();
+        registry
+    }
+
     #[test]
     fn asset_suffix_without_inventory_pin_stays_generic() {
         let registry = ProfileRegistry::with_builtins();
@@ -1090,6 +1240,24 @@ mod tests {
     }
 
     #[test]
+    fn nested_ot0_name_inside_another_content_root_never_activates_or_scopes_the_profile() {
+        let registry = ProfileRegistry::with_builtins();
+        let deceptive_path = "/OtherGame/Content/Mods/Octopath_Traveler0/Content/Local/DataBase/Skill/SkillID.uasset";
+
+        let detection = registry.detect_inventory([deceptive_path]);
+        assert_eq!(detection.status, ProfileDetectionStatus::GenericNoMatch);
+        assert_eq!(detection.selected_profile_id, None);
+
+        let resolved = registry.resolve_asset(deceptive_path, Some("octopath_traveler_0"));
+        assert_eq!(
+            resolved.selection,
+            AssetProfileSelectionKind::GenericNoMatch
+        );
+        assert_eq!(resolved.profile.precision, ProfilePrecision::Generic);
+        assert!(resolved.game_profile.is_none());
+    }
+
+    #[test]
     fn external_inventory_detection_does_not_scope_each_asset_path() {
         let mut document: serde_json::Value =
             serde_json::from_str(include_str!("../../profiles/example-game.profile.json")).unwrap();
@@ -1148,6 +1316,7 @@ mod tests {
         let registry = ProfileRegistry::with_builtins();
         for asset_path in [
             "/Octopath_Traveler0/Content/Local/DataBase/Skill/SkillID.uasset",
+            "../../../Octopath_Traveler0/Content/Local/DataBase/Skill/SkillID.uasset",
             "/Local/DataBase/Skill/SkillID.uasset",
         ] {
             let resolved = registry.resolve_asset(asset_path, Some("octopath_traveler_0"));
@@ -1266,6 +1435,91 @@ mod tests {
     }
 
     #[test]
+    fn audited_profile_rejects_a_partially_present_linked_group() {
+        let registry = ProfileRegistry::with_builtins();
+        let row = parse_messagepack(&map(&[
+            ("m_id", vec![1]),
+            ("m_Avails", vec![0x91, 2]),
+            ("m_Enabled", vec![0xc3]),
+        ]))
+        .unwrap();
+
+        let error = atomic_units_for_row_with_registry(
+            &registry,
+            Some("octopath_traveler_0"),
+            "/Octopath_Traveler0/Content/Local/DataBase/Skill/SkillID",
+            &row,
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, BinaryAssetError::MissingField(field) if field.contains("avail_effective_slots") && field.contains("m_Effectives"))
+        );
+    }
+
+    #[test]
+    fn strict_planner_allows_per_row_omission_but_rejects_asset_wide_non_observation() {
+        for precision in [ProfilePrecision::Audited, ProfilePrecision::Declared] {
+            let registry = single_group_registry(precision);
+            let row =
+                parse_messagepack(&map(&[("m_id", vec![1]), ("m_Unrelated", vec![2])])).unwrap();
+            let mut planner = AtomicUnitPlanner::new(
+                &registry,
+                Some("observation_test"),
+                "/Local/Database/Table",
+            );
+
+            planner.layout_for_row(&row).unwrap();
+            let error = planner.validate_complete_profile_observation().unwrap_err();
+
+            assert!(
+                matches!(error, BinaryAssetError::MissingField(field) if field.contains("linked_pair") && field.contains("schema drift"))
+            );
+        }
+    }
+
+    #[test]
+    fn strict_planner_observes_complete_groups_even_on_field_order_mismatch() {
+        let registry = single_group_registry(ProfilePrecision::Audited);
+        let carrier =
+            parse_messagepack(&map(&[("m_id", vec![1]), ("m_Unrelated", vec![2])])).unwrap();
+        let donor = parse_messagepack(&map(&[
+            ("m_id", vec![1]),
+            ("m_Left", vec![2]),
+            ("m_Right", vec![3]),
+        ]))
+        .unwrap();
+        let mut planner =
+            AtomicUnitPlanner::new(&registry, Some("observation_test"), "/Local/Database/Table");
+        let carrier_layout = planner.layout_for_row(&carrier).unwrap();
+
+        let donor_layout = planner
+            .layout_for_row_matching_field_order(&donor, &carrier_layout.field_order)
+            .unwrap();
+
+        assert!(donor_layout.is_none());
+        planner.validate_complete_profile_observation().unwrap();
+    }
+
+    #[test]
+    fn strict_planner_rejects_partial_groups_before_field_order_comparison() {
+        let registry = single_group_registry(ProfilePrecision::Declared);
+        let carrier = parse_messagepack(&map(&[("m_id", vec![1])])).unwrap();
+        let partial = parse_messagepack(&map(&[("m_id", vec![1]), ("m_Left", vec![2])])).unwrap();
+        let mut planner =
+            AtomicUnitPlanner::new(&registry, Some("observation_test"), "/Local/Database/Table");
+        let carrier_layout = planner.layout_for_row(&carrier).unwrap();
+
+        let error = planner
+            .layout_for_row_matching_field_order(&partial, &carrier_layout.field_order)
+            .unwrap_err();
+
+        assert!(
+            matches!(error, BinaryAssetError::MissingField(field) if field.contains("linked_pair") && field.contains("m_Right"))
+        );
+    }
+
+    #[test]
     fn atomic_unit_planner_misses_on_value_kind_or_array_length_changes() {
         let registry = ProfileRegistry::empty();
         let mut planner = AtomicUnitPlanner::new(&registry, None, "/Game/Database/Table");
@@ -1358,6 +1612,10 @@ mod tests {
             ("m_Conditions", vec![0x91, 1]),
             ("m_Params", vec![0x91, 2]),
             ("m_AilmentTypes", vec![0x91, 3]),
+            ("m_StatusTypes", vec![0x91, 4]),
+            ("m_WeaponTypes", vec![0x91, 5]),
+            ("m_MagicTypes", vec![0x91, 6]),
+            ("m_Equipment", vec![0x91, 7]),
             ("m_PrioritySkill", vec![0xc3]),
         ]);
         let row = parse_messagepack(&row_raw).unwrap();
@@ -1375,7 +1633,15 @@ mod tests {
             .unwrap();
         assert_eq!(
             condition.fields,
-            ["m_Conditions", "m_Params", "m_AilmentTypes"]
+            [
+                "m_Conditions",
+                "m_Params",
+                "m_AilmentTypes",
+                "m_StatusTypes",
+                "m_WeaponTypes",
+                "m_MagicTypes",
+                "m_Equipment",
+            ]
         );
         assert!(condition.compound);
         assert_eq!(condition.array_index, Some(0));

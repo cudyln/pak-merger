@@ -705,7 +705,7 @@ impl Entry {
         reader: &mut R,
         version: Version,
         compression: &[Option<Compression>],
-        parallel_blocks: bool,
+        #[cfg_attr(not(feature = "oodle"), allow(unused_variables))] parallel_blocks: bool,
         #[allow(unused)] _key: &super::Key,
         buf: &mut W,
     ) -> Result<(), super::Error> {

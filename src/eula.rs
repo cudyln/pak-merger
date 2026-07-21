@@ -99,9 +99,7 @@ fn consent_path_under(root: impl AsRef<Path>, directory: &str) -> PathBuf {
 
 fn read_consent(path: &Path) -> io::Result<Option<EulaConsentRecord>> {
     match fs::read(path) {
-        Ok(bytes) => serde_json::from_slice(&bytes)
-            .map(Some)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).ok()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
@@ -149,20 +147,7 @@ pub fn accept(
         confirmations,
     };
     let path = consent_path()?;
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid consent path"))?;
-    fs::create_dir_all(parent)?;
-    let temporary = parent.join(format!("{CONSENT_FILE_NAME}.partial"));
-    let mut writer = fs::File::create(&temporary)?;
-    serde_json::to_writer_pretty(&mut writer, &record)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    writer.write_all(b"\n")?;
-    writer.sync_all()?;
-    if path.exists() {
-        fs::remove_file(&path)?;
-    }
-    fs::rename(temporary, path)?;
+    write_consent_record(&path, &record)?;
 
     // Migrate the record from the old directory name when possible.
     if let Ok(legacy) = legacy_consent_path() {
@@ -172,6 +157,88 @@ pub fn accept(
         }
     }
     Ok(record)
+}
+
+fn write_consent_record(path: &Path, record: &EulaConsentRecord) -> io::Result<()> {
+    write_consent_record_with(path, record, replace_file_atomically)
+}
+
+fn write_consent_record_with<F>(
+    path: &Path,
+    record: &EulaConsentRecord,
+    install: F,
+) -> io::Result<()>
+where
+    F: FnOnce(&Path, &Path) -> io::Result<()>,
+{
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid consent path"))?;
+    fs::create_dir_all(parent)?;
+    let prefix = format!(".{CONSENT_FILE_NAME}.");
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(parent)?;
+    serde_json::to_writer_pretty(temporary.as_file_mut(), record)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    temporary.write_all(b"\n")?;
+    temporary.as_file().sync_all()?;
+    let temporary = temporary.into_temp_path();
+    install(temporary.as_ref(), path)?;
+    sync_directory(parent)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    fn wide_path(path: &Path) -> io::Result<Vec<u16>> {
+        let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+        if encoded.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "file path contains a NUL character",
+            ));
+        }
+        encoded.push(0);
+        Ok(encoded)
+    }
+
+    let source = wide_path(source)?;
+    let destination = wide_path(destination)?;
+    let succeeded = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if succeeded == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(source, destination)
+}
+
+#[cfg(unix)]
+fn sync_directory(path: &Path) -> io::Result<()> {
+    fs::File::open(path)?.sync_all()
+}
+
+#[cfg(not(unix))]
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    Ok(())
 }
 
 pub fn revoke() -> io::Result<()> {
@@ -192,6 +259,21 @@ pub fn revoke() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn valid_record(locale: EulaLocale) -> EulaConsentRecord {
+        EulaConsentRecord {
+            eula_version: EULA_VERSION.to_owned(),
+            eula_text_sha256: combined_text_sha256(),
+            accepted_at_unix_seconds: 1,
+            accepted_locale: locale,
+            tool_version: "test".to_owned(),
+            confirmations: EulaConfirmations {
+                non_commercial_use: true,
+                original_eula_and_law: true,
+                end_user_responsibility: true,
+            },
+        }
+    }
 
     #[test]
     fn all_three_confirmations_are_required() {
@@ -229,5 +311,57 @@ mod tests {
             PathBuf::from("C:/LocalAppData/PakMerger/eula-consent-v1.json")
         );
         assert!(!SETTINGS_DIRECTORY.contains(' '));
+    }
+
+    #[test]
+    fn corrupt_consent_is_treated_as_not_accepted() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONSENT_FILE_NAME);
+        fs::write(&path, b"{not json").unwrap();
+
+        assert_eq!(read_consent(&path).unwrap(), None);
+    }
+
+    #[test]
+    fn non_content_read_errors_are_not_treated_as_missing_consent() {
+        let directory = tempfile::tempdir().unwrap();
+        assert!(read_consent(directory.path()).is_err());
+    }
+
+    #[test]
+    fn atomic_replacement_updates_an_existing_consent_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONSENT_FILE_NAME);
+        let first = valid_record(EulaLocale::English);
+        let second = valid_record(EulaLocale::Japanese);
+
+        write_consent_record(&path, &first).unwrap();
+        write_consent_record(&path, &second).unwrap();
+
+        assert_eq!(read_consent(&path).unwrap(), Some(second));
+    }
+
+    #[test]
+    fn failed_atomic_replacement_preserves_existing_bytes_and_cleans_unique_temps() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join(CONSENT_FILE_NAME);
+        let existing = b"existing consent";
+        fs::write(&path, existing).unwrap();
+        let record = valid_record(EulaLocale::Korean);
+        let mut temporary_names = Vec::new();
+
+        for _ in 0..2 {
+            let error = write_consent_record_with(&path, &record, |temporary, destination| {
+                temporary_names.push(temporary.to_path_buf());
+                assert_eq!(destination, path);
+                Err(io::Error::other("injected install failure"))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::Other);
+            assert_eq!(fs::read(&path).unwrap(), existing);
+        }
+
+        assert_ne!(temporary_names[0], temporary_names[1]);
+        assert!(temporary_names.iter().all(|temporary| !temporary.exists()));
     }
 }

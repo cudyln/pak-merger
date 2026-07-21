@@ -21,6 +21,10 @@
 - `detection`: 게임이나 데이터 구성을 판별할 Pak 내부 경로 조건입니다.
 - `assets`: 데이터베이스 파일을 찾고 관련 필드를 묶는 규칙입니다.
 
+`detection.rootScopeMatchers`를 지정하면 선택된 프로필이 다른 게임의
+루트 경로에 적용되지 않습니다. 공통 Content 루트를 정리한 상대 경로에는
+기존과 같은 방식으로 적용됩니다.
+
 경로 조건은 `exact`, `prefix`, `suffix`, `contains` 중 하나를 사용합니다. 경로는 `/`로 시작하고 구분자로 `/`를 사용하며 대소문자를 구분하지 않습니다.
 
 각 파일 규칙의 `fieldGroups`에는 다음 방식 중 하나를 사용할 수 있습니다.
@@ -29,6 +33,56 @@
 - `parallel_array_items`: 관련 배열의 길이가 같을 때 같은 순번끼리 묶어 선택합니다.
 
 묶음에 적지 않은 값은 범용 규칙을 따릅니다. 최상위의 단순 값은 따로 선택할 수 있으며 배열과 중첩 값은 한 묶음으로 유지합니다.
+
+## Rust 라이브러리 API
+
+외부 프로필을 레지스트리에 등록한 뒤, 비교와 저장 모두 레지스트리가
+지정된 분석 세션을 사용합니다. 저장이 끝날 때까지 같은 세션을 유지해야
+합니다. 분석 계획만 받는 `write` 함수는 내장 프로필만 사용합니다.
+
+```rust
+use pak_merger::profiles::{ProfileRegistry, load_external_profile_file};
+use pak_merger::{
+    AnalysisRequest, ResolutionSet, WriteOptions, analyze_session_with_registry,
+    write_session_with_options_and_progress,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+fn merge_with_profile(
+    profile_path: &Path,
+    first_pak: &Path,
+    second_pak: &Path,
+    output_pak: &Path,
+    choices: BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = ProfileRegistry::with_builtins();
+    registry.register(load_external_profile_file(profile_path)?)?;
+    let session = analyze_session_with_registry(
+        AnalysisRequest {
+            pak_paths: vec![first_pak.to_owned(), second_pak.to_owned()],
+            carrier_path: first_pak.to_owned(),
+        },
+        Arc::new(registry),
+    )?;
+
+    // 각 항목은 session.plan()의 차단형 충돌 ID와 그 충돌에서 선택한
+    // 값의 variant ID를 연결합니다.
+    let resolutions = ResolutionSet {
+        plan_id: session.plan().plan_id.clone(),
+        choices,
+    };
+    write_session_with_options_and_progress(
+        &session,
+        resolutions,
+        output_pak,
+        WriteOptions::default(),
+        |_| {},
+    )?;
+    Ok(())
+}
+```
 
 ## 예제
 

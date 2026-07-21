@@ -97,6 +97,18 @@ pub(super) fn asset_rules() -> Vec<AssetProfileRule> {
                         "m_OffsetsV",
                     ],
                 ),
+                indexed(
+                    "sound_voice_slots",
+                    &[
+                        "m_Sounds",
+                        "m_SoundTimes",
+                        "m_SoundToVoice",
+                        "m_Voices1",
+                        "m_Voices2",
+                        "m_Voices3",
+                        "m_VoiceTimes",
+                    ],
+                ),
                 indexed("text_slots", &["m_Texts", "m_TextTime"]),
                 indexed(
                     "visibility_slots",
@@ -152,4 +164,37 @@ pub(super) fn asset_rules() -> Vec<AssetProfileRule> {
             )],
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn skill_effective_sound_and_voice_arrays_share_each_slot() {
+        let rule = asset_rules()
+            .into_iter()
+            .find(|rule| rule.profile.id == "skill_effective_id")
+            .unwrap();
+        let group = rule
+            .profile
+            .groups
+            .iter()
+            .find(|group| group.id == "sound_voice_slots")
+            .unwrap();
+
+        assert!(group.index_coupled);
+        assert_eq!(
+            group.fields,
+            [
+                "m_Sounds",
+                "m_SoundTimes",
+                "m_SoundToVoice",
+                "m_Voices1",
+                "m_Voices2",
+                "m_Voices3",
+                "m_VoiceTimes",
+            ]
+        );
+    }
 }

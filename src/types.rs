@@ -7,6 +7,7 @@ pub const ANALYSIS_PROGRESS_STEPS_PER_ITEM: usize = 1_000_000;
 
 pub const MAX_SUPPORTED_PAKS: usize = 64;
 pub const MAX_SUPPORTED_TOTAL_BYTES: u64 = 128 * 1024 * 1024 * 1024;
+pub const MERGE_PLAN_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PakInput {

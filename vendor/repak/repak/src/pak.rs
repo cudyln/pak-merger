@@ -467,8 +467,10 @@ impl Pak {
         let footer = super::footer::Footer::read(reader, version)?;
         // read index to get all the entry info
         reader.seek(io::SeekFrom::Start(footer.index_offset))?;
+        let index_size = usize::try_from(footer.index_size)
+            .map_err(|_| super::Error::Other("Pak index size does not fit usize".to_owned()))?;
         #[allow(unused_mut)]
-        let mut index = reader.read_len(footer.index_size as usize)?;
+        let mut index = reader.read_len(index_size)?;
 
         // decrypt index if needed
         if footer.encrypted {
@@ -492,7 +494,10 @@ impl Pak {
                 let _path_hash_index_hash = index.read_len(20)?;
 
                 reader.seek(io::SeekFrom::Start(path_hash_index_offset))?;
-                let mut path_hash_index_buf = reader.read_len(path_hash_index_size as usize)?;
+                let path_hash_index_size = usize::try_from(path_hash_index_size).map_err(|_| {
+                    super::Error::Other("path-hash index size does not fit usize".to_owned())
+                })?;
+                let mut path_hash_index_buf = reader.read_len(path_hash_index_size)?;
                 // TODO verify hash
 
                 if footer.encrypted {
@@ -522,9 +527,14 @@ impl Pak {
                 let _full_directory_index_hash = index.read_len(20)?;
 
                 reader.seek(io::SeekFrom::Start(full_directory_index_offset))?;
+                let full_directory_index_size = usize::try_from(full_directory_index_size)
+                    .map_err(|_| {
+                        super::Error::Other(
+                            "full-directory index size does not fit usize".to_owned(),
+                        )
+                    })?;
                 #[allow(unused_mut)]
-                let mut full_directory_index =
-                    reader.read_len(full_directory_index_size as usize)?;
+                let mut full_directory_index = reader.read_len(full_directory_index_size)?;
                 // TODO verify hash
 
                 if footer.encrypted {
@@ -556,9 +566,20 @@ impl Pak {
             let encoded_entries = index.read_len(size)?;
 
             let non_encoded_entry_count = index.read_u32::<LE>()? as usize;
-            let mut non_encoded_entries = Vec::with_capacity(non_encoded_entry_count);
+            let mut non_encoded_entries = Vec::new();
+            non_encoded_entries
+                .try_reserve_exact(non_encoded_entry_count)
+                .map_err(|_| {
+                    super::Error::Other("non-encoded entry table is too large".to_owned())
+                })?;
             for _ in 0..non_encoded_entry_count {
                 non_encoded_entries.push(Entry::read(&mut index, version)?);
+            }
+
+            if full_directory_index.is_none() && len != 0 {
+                return Err(super::Error::Other(format!(
+                    "modern Pak declares {len} files but has no full-directory index"
+                )));
             }
 
             let mut entries_by_path = BTreeMap::new();
@@ -570,8 +591,20 @@ impl Pak {
                             encoded_entries.set_position(*encoded_offset as u64);
                             Entry::read_encoded(&mut encoded_entries, version)?
                         } else {
-                            let index = (-*encoded_offset) as usize - 1;
-                            non_encoded_entries[index].clone()
+                            let index = (*encoded_offset)
+                                .checked_neg()
+                                .and_then(|index| index.checked_sub(1))
+                                .and_then(|index| usize::try_from(index).ok())
+                                .ok_or_else(|| {
+                                    super::Error::Other(format!(
+                                        "invalid non-encoded entry offset {encoded_offset}"
+                                    ))
+                                })?;
+                            non_encoded_entries.get(index).cloned().ok_or_else(|| {
+                                super::Error::Other(format!(
+                                    "non-encoded entry offset {encoded_offset} is out of range"
+                                ))
+                            })?
                         };
                         let path = format!(
                             "{}{}",
@@ -581,6 +614,12 @@ impl Pak {
                         entries_by_path.insert(path, entry);
                     }
                 }
+            }
+            if entries_by_path.len() != len {
+                return Err(super::Error::Other(format!(
+                    "full-directory index contains {} files, expected {len}",
+                    entries_by_path.len()
+                )));
             }
 
             Index {
@@ -673,11 +712,10 @@ impl Pak {
             //     - Offset (u32)
             //     - Size (u32)
             let bytes_before_phi = {
-                let mut size = 0;
-                size += 4; // mount point len
-                size += self.mount_point.len() as u64 + 1; // mount point string w/ NUL byte
-                size += 8; // path hash seed
-                size += 4; // record count
+                // `write_string` uses UTF-16 for non-ASCII mount points, so
+                // derive the serialized prefix from the cursor rather than
+                // estimating it from UTF-8 bytes.
+                let mut size = index_writer.position();
                 size += 4; // has path hash index (since we're generating, always true)
                 size += 8 + 8 + 20; // path hash index offset, size and hash
                 size += 4; // has full directory index (since we're generating, always true)
@@ -851,7 +889,72 @@ fn encrypt(key: aes::Aes256, bytes: &mut [u8]) {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::ext::WriteExt;
+    use byteorder::{WriteBytesExt, LE};
     use std::io::Cursor;
+
+    fn one_file_v11(mount_point: &str) -> Vec<u8> {
+        let mut writer = PakBuilder::new().writer(
+            Cursor::new(Vec::new()),
+            Version::V11,
+            mount_point.to_owned(),
+            Some(0x1234_5678),
+        );
+        writer
+            .write_file("Data/Test.bin", false, b"payload")
+            .unwrap();
+        writer.write_index().unwrap().into_inner()
+    }
+
+    #[test]
+    fn modern_writer_round_trips_a_non_ascii_mount_point() {
+        let mount_point = "../../../게임/Content/";
+        let bytes = one_file_v11(mount_point);
+        let mut source = Cursor::new(bytes);
+        let reader = PakBuilder::new()
+            .reader_with_version(&mut source, Version::V11)
+            .unwrap();
+
+        assert_eq!(reader.mount_point(), mount_point);
+        assert_eq!(reader.files(), ["Data/Test.bin"]);
+        assert_eq!(
+            reader.get("Data/Test.bin", &mut source).unwrap(),
+            b"payload"
+        );
+    }
+
+    #[test]
+    fn nonempty_modern_pak_without_full_directory_index_is_rejected() {
+        let mut bytes = Vec::new();
+        bytes.write_string("../../../Example/Content/").unwrap();
+        bytes.write_u32::<LE>(1).unwrap();
+        bytes.write_u64::<LE>(0).unwrap();
+        bytes.write_u32::<LE>(0).unwrap(); // no path-hash index
+        bytes.write_u32::<LE>(0).unwrap(); // no full-directory index
+        bytes.write_u32::<LE>(0).unwrap(); // encoded entries size
+        bytes.write_u32::<LE>(0).unwrap(); // non-encoded entries
+        let footer = crate::footer::Footer {
+            encryption_uuid: None,
+            encrypted: false,
+            magic: crate::MAGIC,
+            version: Version::V11,
+            version_major: Version::V11.version_major(),
+            index_offset: 0,
+            index_size: bytes.len() as u64,
+            hash: hash(&bytes),
+            frozen: false,
+            compression: vec![None; 5],
+        };
+        footer.write(&mut bytes).unwrap();
+
+        let error = PakBuilder::new()
+            .reader_with_version(&mut Cursor::new(bytes), Version::V11)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("no full-directory index"),
+            "unexpected error: {error}"
+        );
+    }
 
     fn deterministic_payload(size: usize) -> Vec<u8> {
         let mut state = 0x9e37_79b9_u32;

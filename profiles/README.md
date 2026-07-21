@@ -21,6 +21,10 @@ A profile contains:
 - `detection`: Pak path rules used to identify the game or data layout.
 - `assets`: Rules for matching database files and grouping related fields.
 
+`detection.rootScopeMatchers` limits a selected profile to its own rooted
+content paths. Relative paths produced after a common content root is removed
+continue to work normally.
+
 Path matchers use `exact`, `prefix`, `suffix`, or `contains`. Paths begin with `/`, use `/` as the separator, and are matched without regard to letter case.
 
 Each asset rule may contain `fieldGroups` with one of these modes:
@@ -29,6 +33,56 @@ Each asset rule may contain `fieldGroups` with one of these modes:
 - `parallel_array_items`: Select matching positions across related arrays when their lengths agree.
 
 Values not listed in a group follow Pak Merger's general rules. Simple top-level values may be selected separately, while arrays and nested values stay together.
+
+## Rust Library API
+
+Load external profiles into a registry, then use the registry-backed analysis
+session for both comparison and output. Keep that session alive until writing
+finishes; the plan-only `write` function uses built-in profiles only.
+
+```rust
+use pak_merger::profiles::{ProfileRegistry, load_external_profile_file};
+use pak_merger::{
+    AnalysisRequest, ResolutionSet, WriteOptions, analyze_session_with_registry,
+    write_session_with_options_and_progress,
+};
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
+fn merge_with_profile(
+    profile_path: &Path,
+    first_pak: &Path,
+    second_pak: &Path,
+    output_pak: &Path,
+    choices: BTreeMap<String, String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut registry = ProfileRegistry::with_builtins();
+    registry.register(load_external_profile_file(profile_path)?)?;
+    let session = analyze_session_with_registry(
+        AnalysisRequest {
+            pak_paths: vec![first_pak.to_owned(), second_pak.to_owned()],
+            carrier_path: first_pak.to_owned(),
+        },
+        Arc::new(registry),
+    )?;
+
+    // Each entry maps a blocking conflict ID from session.plan() to one of
+    // that conflict's variant IDs.
+    let resolutions = ResolutionSet {
+        plan_id: session.plan().plan_id.clone(),
+        choices,
+    };
+    write_session_with_options_and_progress(
+        &session,
+        resolutions,
+        output_pak,
+        WriteOptions::default(),
+        |_| {},
+    )?;
+    Ok(())
+}
+```
 
 ## Example
 

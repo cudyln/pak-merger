@@ -1,6 +1,6 @@
 [package]
 name = "pak-merger"
-version = "1.0.0-r1"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.97.1"
 publish = false
@@ -36,7 +36,7 @@ tempfile = "3.20"
 thiserror = "2.0"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_SystemInformation"] }
 
 [dev-dependencies]
 proptest = "1.7"

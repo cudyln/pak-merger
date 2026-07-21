@@ -34,14 +34,14 @@ pub(super) fn game_profile() -> GameProfile {
         origin: ProfileOrigin::BuiltIn,
         detection_matchers: vec![
             matcher(
-                PathMatchKind::Contains,
+                PathMatchKind::Prefix,
                 "/octopath_traveler0/content/local/database/",
             ),
-            matcher(PathMatchKind::Contains, "/octopath_traveler0/content/"),
+            matcher(PathMatchKind::Prefix, "/octopath_traveler0/content/"),
         ],
         minimum_detection_matches: 1,
         root_scope_matchers: vec![matcher(
-            PathMatchKind::Contains,
+            PathMatchKind::Prefix,
             "/octopath_traveler0/content/",
         )],
         assets,

@@ -1,14 +1,16 @@
 use eframe::egui;
 use pak_merger::eula::{self, EulaConfirmations, EulaLocale, PRODUCT_NAME};
 use pak_merger::types::{
-    AnalysisRequest, Conflict, ConflictKind, MergePlan, MergeProgress, MergeProgressStage,
-    MergeReport, OutputCompression, ResolutionSet, Variant, WriteOptions,
+    AnalysisRequest, Conflict, ConflictKind, InputDescriptor, MAX_SUPPORTED_PAKS,
+    MAX_SUPPORTED_TOTAL_BYTES, MergePlan, MergeProgress, MergeProgressStage, MergeReport,
+    OutputCompression, ResolutionSet, Variant, WriteOptions,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 
 const DEFAULT_MERGED_PAK_FILE_NAME: &str = "ZZMerge_P.pak";
 const GITHUB_REPOSITORY_URL: &str = "https://github.com/cudyln/pak-merger";
@@ -20,7 +22,40 @@ enum WorkerResult {
 
 enum WorkerMessage {
     Progress(MergeProgress),
-    Finished(Result<WorkerResult, String>),
+    Finished(Result<WorkerResult, WorkerFailure>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerFailureKind {
+    InputChanged,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerFailure {
+    kind: WorkerFailureKind,
+    message: String,
+}
+
+impl WorkerFailure {
+    fn from_merge_error(error: pak_merger::merge::MergeError) -> Self {
+        let kind = if matches!(&error, pak_merger::merge::MergeError::InputChanged(_)) {
+            WorkerFailureKind::InputChanged
+        } else {
+            WorkerFailureKind::Other
+        };
+        Self {
+            kind,
+            message: error.to_string(),
+        }
+    }
+
+    fn from_panic(payload: Box<dyn std::any::Any + Send>) -> Self {
+        Self {
+            kind: WorkerFailureKind::Other,
+            message: worker_panic_message(payload),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -29,6 +64,22 @@ struct PendingBulkSelection {
     display_name: String,
     filter: String,
     count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InputAdmissionError {
+    TooMany,
+    SizeUnavailable { path: PathBuf, reason: String },
+    TotalTooLarge { total: u64 },
+}
+
+impl InputAdmissionError {
+    fn detail(&self) -> Option<String> {
+        match self {
+            Self::SizeUnavailable { path, reason } => Some(format!("{}: {reason}", path.display())),
+            Self::TooMany | Self::TotalTooLarge { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +262,9 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         "An input Pak changed after analysis. Analyze the Paks again." => {
             "解析後に入力 Pak が変更されました。もう一度解析してください。"
         }
+        "An input Pak changed and is being checked again. Wait for the Pak check to finish, then analyze again." => {
+            "入力 Pak が変更されたため、再確認しています。Pak の確認が終わったら、もう一度解析してください。"
+        }
         "Analyze" => "解析",
         "Analyzing…" => "解析中…",
         "Apply" => "適用",
@@ -220,6 +274,7 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         "Indexing database" => "データベースを確認",
         "Building and checking the merged Pak…" => "統合 Pak を作成して検査しています…",
         "Cancel" => "キャンセル",
+        "Final data-link check notes" => "最終データリンク確認の注意事項",
         "Cancel operation" => "処理をキャンセル",
         "Cancelling..." => "キャンセルしています…",
         "Category code" => "分類コード",
@@ -431,7 +486,8 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
 
 struct MergerApp {
     locale: UiLocale,
-    cjk_font_available: bool,
+    korean_font_available: bool,
+    japanese_font_available: bool,
     consent_valid: bool,
     eula_confirmations: EulaConfirmations,
     show_terms: bool,
@@ -453,13 +509,16 @@ struct MergerApp {
     status: String,
     status_detail: Option<String>,
     completed_output: Option<PathBuf>,
+    completed_reference_warnings: Vec<String>,
     pending_overwrite: Option<PathBuf>,
     worker: Option<Receiver<WorkerMessage>>,
+    worker_handle: Option<JoinHandle<()>>,
     cancel_signal: Option<pak_merger::CancellationToken>,
     merge_progress: Option<MergeProgress>,
     operation_started_at: Option<std::time::Instant>,
-    inspection_requests: Sender<PakInspectionJob>,
+    inspection_requests: Option<Sender<PakInspectionJob>>,
     inspection_results: Receiver<PakInspectionMessage>,
+    inspection_worker_handles: Vec<JoinHandle<()>>,
     inspections: BTreeMap<String, CachedPakInspection>,
     next_inspection_generation: u64,
     last_consent_check: std::time::Instant,
@@ -467,10 +526,12 @@ struct MergerApp {
 
 impl Default for MergerApp {
     fn default() -> Self {
-        let (inspection_requests, inspection_results) = inspection_worker();
+        let (inspection_requests, inspection_results, inspection_worker_handles) =
+            inspection_worker();
         Self {
             locale: UiLocale::from_system(),
-            cjk_font_available: true,
+            korean_font_available: true,
+            japanese_font_available: true,
             consent_valid: eula::has_valid_consent(),
             eula_confirmations: EulaConfirmations::default(),
             show_terms: false,
@@ -492,17 +553,26 @@ impl Default for MergerApp {
             status: String::new(),
             status_detail: None,
             completed_output: None,
+            completed_reference_warnings: Vec::new(),
             pending_overwrite: None,
             worker: None,
+            worker_handle: None,
             cancel_signal: None,
             merge_progress: None,
             operation_started_at: None,
-            inspection_requests,
+            inspection_requests: Some(inspection_requests),
             inspection_results,
+            inspection_worker_handles,
             inspections: BTreeMap::new(),
             next_inspection_generation: 1,
             last_consent_check: std::time::Instant::now(),
         }
+    }
+}
+
+impl Drop for MergerApp {
+    fn drop(&mut self) {
+        self.shutdown_background_work();
     }
 }
 
@@ -626,6 +696,7 @@ impl MergerApp {
     }
 
     fn draw_locale_picker(&mut self, ui: &mut egui::Ui, id: &str) {
+        let mut requested_locale = self.locale;
         egui::ComboBox::from_id_salt(id)
             .selected_text(match self.locale {
                 UiLocale::Korean => "한국어",
@@ -633,15 +704,36 @@ impl MergerApp {
                 UiLocale::Japanese => "日本語",
             })
             .show_ui(ui, |ui| {
-                ui.add_enabled_ui(self.cjk_font_available, |ui| {
-                    ui.selectable_value(&mut self.locale, UiLocale::Korean, "한국어");
-                    ui.selectable_value(&mut self.locale, UiLocale::Japanese, "日本語");
+                ui.add_enabled_ui(self.korean_font_available, |ui| {
+                    ui.selectable_value(&mut requested_locale, UiLocale::Korean, "한국어");
                 });
-                ui.selectable_value(&mut self.locale, UiLocale::English, "English");
-                if !self.cjk_font_available {
+                ui.add_enabled_ui(self.japanese_font_available, |ui| {
+                    ui.selectable_value(&mut requested_locale, UiLocale::Japanese, "日本語");
+                });
+                ui.selectable_value(&mut requested_locale, UiLocale::English, "English");
+                if !self.korean_font_available && !self.japanese_font_available {
                     ui.small("Only English is available because no Windows CJK font was found.");
                 }
             });
+        if requested_locale != self.locale {
+            if configure_locale_fonts(ui.ctx(), requested_locale) {
+                self.locale = requested_locale;
+            } else {
+                self.status = match requested_locale {
+                    UiLocale::Korean => {
+                        "한국어 글꼴을 불러올 수 없어 언어를 변경하지 않았습니다.".to_owned()
+                    }
+                    UiLocale::Japanese => {
+                        "日本語フォントを読み込めなかったため、言語を変更しませんでした。"
+                            .to_owned()
+                    }
+                    UiLocale::English => {
+                        "The default interface font could not be restored.".to_owned()
+                    }
+                };
+                self.status_detail = None;
+            }
+        }
     }
 
     fn is_busy(&self) -> bool {
@@ -656,6 +748,7 @@ impl MergerApp {
         self.selected_conflict_id = None;
         self.pending_bulk = None;
         self.completed_output = None;
+        self.completed_reference_warnings.clear();
         self.pending_overwrite = None;
         self.status.clear();
         self.status_detail = None;
@@ -675,6 +768,11 @@ impl MergerApp {
             .iter()
             .any(|existing| same_path(existing, &path))
         {
+            return;
+        }
+        if let Err(error) = preflight_pak_addition(&self.pak_paths, &path) {
+            self.status = input_admission_message(&error, self.locale);
+            self.status_detail = error.detail();
             return;
         }
         self.pak_paths.push(path.clone());
@@ -734,17 +832,17 @@ impl MergerApp {
                 cancellation: cancellation.clone(),
             },
         );
-        if self
-            .inspection_requests
-            .send(PakInspectionJob {
-                key: key.clone(),
-                generation,
-                path,
-                cancellation,
-                multithreaded: self.multithreaded,
-            })
-            .is_err()
-            && let Some(cached) = self.inspections.get_mut(&key)
+        if self.inspection_requests.as_ref().is_none_or(|requests| {
+            requests
+                .send(PakInspectionJob {
+                    key: key.clone(),
+                    generation,
+                    path,
+                    cancellation,
+                    multithreaded: self.multithreaded,
+                })
+                .is_err()
+        }) && let Some(cached) = self.inspections.get_mut(&key)
         {
             cached.status =
                 PakInspectionStatus::Failed("Pak inspection could not start.".to_owned());
@@ -863,7 +961,7 @@ impl MergerApp {
         let multithreaded = self.multithreaded;
         let cancellation = pak_merger::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
-        std::thread::spawn(move || {
+        let worker_handle = std::thread::spawn(move || {
             let progress_sender = sender.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 pak_merger::merge::analyze_with_archives_progress_cancel_and_threads(
@@ -881,12 +979,13 @@ impl MergerApp {
                     },
                 )
             }))
-            .map_err(worker_panic_message)
-            .and_then(|result| result.map_err(|error| error.to_string()))
+            .map_err(WorkerFailure::from_panic)
+            .and_then(|result| result.map_err(WorkerFailure::from_merge_error))
             .map(|session| WorkerResult::Analyzed(Box::new(session)));
             let _ = sender.send(WorkerMessage::Finished(result));
         });
         self.worker = Some(receiver);
+        self.worker_handle = Some(worker_handle);
         self.cancel_signal = Some(cancellation);
         self.merge_progress = None;
         self.operation_started_at = Some(std::time::Instant::now());
@@ -907,7 +1006,7 @@ impl MergerApp {
         let (sender, receiver) = mpsc::channel();
         let cancellation = pak_merger::CancellationToken::new();
         let worker_cancellation = cancellation.clone();
-        std::thread::spawn(move || {
+        let worker_handle = std::thread::spawn(move || {
             let progress_sender = sender.clone();
             let result = catch_unwind(AssertUnwindSafe(|| {
                 pak_merger::merge::write_session_with_options_progress_and_cancel(
@@ -925,16 +1024,18 @@ impl MergerApp {
                     },
                 )
             }))
-            .map_err(worker_panic_message)
-            .and_then(|result| result.map_err(|error| error.to_string()))
+            .map_err(WorkerFailure::from_panic)
+            .and_then(|result| result.map_err(WorkerFailure::from_merge_error))
             .map(|report| WorkerResult::Merged(Box::new(report)));
             let _ = sender.send(WorkerMessage::Finished(result));
         });
         self.worker = Some(receiver);
+        self.worker_handle = Some(worker_handle);
         self.cancel_signal = Some(cancellation);
         self.merge_progress = None;
         self.operation_started_at = Some(std::time::Instant::now());
         self.completed_output = None;
+        self.completed_reference_warnings.clear();
         self.status = self
             .tr(
                 "병합 Pak을 만들고 확인하는 중…",
@@ -1013,14 +1114,18 @@ impl MergerApp {
                     finished = true;
                 }
                 WorkerMessage::Finished(Ok(WorkerResult::Merged(report))) => {
-                    self.completed_output = Some(report.output_path.clone());
-                    self.status.clear();
-                    self.status_detail = None;
+                    let report = *report;
+                    self.complete_merge(report.output_path, report.reference_validation_warnings);
                     finished = true;
                 }
-                WorkerMessage::Finished(Err(error)) => {
-                    self.status = friendly_operation_error(&error, self.locale).to_owned();
-                    self.status_detail = Some(error);
+                WorkerMessage::Finished(Err(failure)) => {
+                    if failure.kind == WorkerFailureKind::InputChanged {
+                        self.recover_from_changed_input(failure.message);
+                    } else {
+                        self.status =
+                            friendly_operation_error(&failure.message, self.locale).to_owned();
+                        self.status_detail = Some(failure.message);
+                    }
                     finished = true;
                 }
             }
@@ -1045,7 +1150,57 @@ impl MergerApp {
             self.cancel_signal = None;
             self.merge_progress = None;
             self.operation_started_at = None;
+            self.join_active_worker();
         }
+    }
+
+    fn complete_merge(&mut self, output_path: PathBuf, reference_warnings: Vec<String>) {
+        self.completed_output = Some(output_path);
+        self.completed_reference_warnings = reference_warnings;
+        self.status.clear();
+        self.status_detail = None;
+    }
+
+    fn recover_from_changed_input(&mut self, detail: String) {
+        self.invalidate_analysis();
+        let paths = self.pak_paths.clone();
+        for path in paths {
+            if let Some(cached) = self.inspections.remove(&path_key(&path)) {
+                cached.cancellation.cancel();
+            }
+            self.queue_pak_inspection(path);
+        }
+        self.status = self
+            .tr(
+                "입력 Pak이 변경되어 다시 확인하고 있습니다. Pak 확인이 끝나면 다시 분석하세요.",
+                "An input Pak changed and is being checked again. Wait for the Pak check to finish, then analyze again.",
+            )
+            .to_owned();
+        self.status_detail = Some(detail);
+    }
+
+    fn join_active_worker(&mut self) {
+        if let Some(handle) = self.worker_handle.take() {
+            let _ = handle.join();
+        }
+    }
+
+    fn shutdown_background_work(&mut self) {
+        if let Some(cancellation) = &self.cancel_signal {
+            cancellation.cancel();
+        }
+        for cached in self.inspections.values() {
+            cached.cancellation.cancel();
+        }
+        // Dropping the last request sender wakes idle inspection workers. Active
+        // jobs see their per-job cancellation above before these joins return.
+        self.inspection_requests.take();
+        self.join_active_worker();
+        for handle in self.inspection_worker_handles.drain(..) {
+            let _ = handle.join();
+        }
+        self.worker = None;
+        self.cancel_signal = None;
     }
 
     fn choose_variant(&mut self, conflict_id: &str, variant_id: &str) {
@@ -1091,6 +1246,26 @@ impl MergerApp {
         }
         if !changes.is_empty() {
             self.undo.push(ResolutionUndo::Batch(changes));
+        }
+    }
+
+    fn refresh_pending_bulk(&mut self, current_filter: &str) {
+        let Some(pending) = self.pending_bulk.as_ref() else {
+            return;
+        };
+        let count = self
+            .plan
+            .as_ref()
+            .map(|plan| {
+                collect_bulk_updates(plan, &self.resolutions, &pending.input_id, current_filter)
+                    .len()
+            })
+            .unwrap_or(0);
+        if count == 0 {
+            self.pending_bulk = None;
+        } else if let Some(pending) = self.pending_bulk.as_mut() {
+            pending.count = count;
+            pending.filter = current_filter.to_owned();
         }
     }
 
@@ -1752,23 +1927,10 @@ impl eframe::App for MergerApp {
                 let mut counts = BTreeMap::<String, usize>::new();
                 if let Some(plan) = self.plan.as_ref() {
                     for input in &plan.inputs {
-                        counts.insert(input.id.clone(), 0);
-                    }
-                    for &index in &visible_indices {
-                        let conflict = &plan.conflicts[index];
-                        if !is_user_selectable_conflict(conflict)
-                            || self.resolutions.choices.contains_key(&conflict.id)
-                        {
-                            continue;
-                        }
-                        let mut counted = BTreeSet::new();
-                        for variant in &conflict.variants {
-                            if counted.insert(&variant.input_id)
-                                && let Some(count) = counts.get_mut(&variant.input_id)
-                            {
-                                *count += 1;
-                            }
-                        }
+                        counts.insert(
+                            input.id.clone(),
+                            collect_bulk_updates(plan, &self.resolutions, &input.id, &needle).len(),
+                        );
                     }
                 }
 
@@ -1781,11 +1943,15 @@ impl eframe::App for MergerApp {
                     if let Some(plan) = self.plan.as_ref() {
                         for input in &plan.inputs {
                             let count = counts.get(&input.id).copied().unwrap_or(0);
-                            let text = format!("{} ({count})", input.display_name);
-                            if ui.add_enabled(count > 0, egui::Button::new(text)).clicked() {
+                            let display_name = input_display_label(input, &plan.inputs);
+                            let text = format!("{display_name} ({count})");
+                            let response = ui
+                                .add_enabled(count > 0, egui::Button::new(text))
+                                .on_hover_text(input.path.display().to_string());
+                            if response.clicked() {
                                 requested_bulk = Some(PendingBulkSelection {
                                     input_id: input.id.clone(),
-                                    display_name: input.display_name.clone(),
+                                    display_name,
                                     filter: needle.clone(),
                                     count,
                                 });
@@ -1796,6 +1962,7 @@ impl eframe::App for MergerApp {
                 if let Some(requested_bulk) = requested_bulk {
                     self.pending_bulk = Some(requested_bulk);
                 }
+                self.refresh_pending_bulk(&needle);
 
                 let mut confirm_bulk = false;
                 let mut cancel_bulk = false;
@@ -1908,6 +2075,7 @@ impl eframe::App for MergerApp {
                                                     ui,
                                                     &plan.conflicts[index],
                                                     &plan.carrier_input_id,
+                                                    &plan.inputs,
                                                     &self.resolutions,
                                                     self.locale,
                                                     &mut pending_choices,
@@ -1935,6 +2103,7 @@ impl eframe::App for MergerApp {
                                 ui,
                                 &plan.conflicts[index],
                                 &plan.carrier_input_id,
+                                &plan.inputs,
                                 &self.resolutions,
                                 self.locale,
                                 &mut pending_choices,
@@ -1991,6 +2160,26 @@ impl eframe::App for MergerApp {
                                 "Disable the source mod Paks before using the merged Pak.",
                             ),
                         );
+                        if !self.completed_reference_warnings.is_empty() {
+                            ui.separator();
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                egui::RichText::new(self.tr(
+                                    "최종 데이터 연결 검사 참고 사항",
+                                    "Final data-link check notes",
+                                ))
+                                .strong(),
+                            );
+                            for warning in &self.completed_reference_warnings {
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!("• {warning}"))
+                                            .color(egui::Color32::YELLOW),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        }
                     });
             }
 
@@ -2196,18 +2385,27 @@ impl eframe::App for MergerApp {
             }
         }
     }
+
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.shutdown_background_work();
+    }
 }
 
-fn inspection_worker() -> (Sender<PakInspectionJob>, Receiver<PakInspectionMessage>) {
+fn inspection_worker() -> (
+    Sender<PakInspectionJob>,
+    Receiver<PakInspectionMessage>,
+    Vec<JoinHandle<()>>,
+) {
     let (request_sender, request_receiver) = mpsc::channel::<PakInspectionJob>();
     let (result_sender, result_receiver) = mpsc::channel::<PakInspectionMessage>();
     let request_receiver = Arc::new(Mutex::new(request_receiver));
     // Scan a few Paks at once without overwhelming slower disks.
     let worker_count = pak_merger::resources::worker_threads().clamp(1, 4);
+    let mut worker_handles = Vec::with_capacity(worker_count);
     for _ in 0..worker_count {
         let request_receiver = Arc::clone(&request_receiver);
         let result_sender = result_sender.clone();
-        std::thread::spawn(move || {
+        worker_handles.push(std::thread::spawn(move || {
             loop {
                 let job = {
                     let Ok(receiver) = request_receiver.lock() else {
@@ -2220,7 +2418,7 @@ fn inspection_worker() -> (Sender<PakInspectionJob>, Receiver<PakInspectionMessa
                 };
                 let progress_sender = result_sender.clone();
                 let progress_key = job.key.clone();
-                let result =
+                let result = catch_inspection_job(|| {
                     pak_merger::pak::PakArchive::open_fast_with_progress_cancel_and_threads(
                         &job.path,
                         &job.cancellation,
@@ -2263,7 +2461,8 @@ fn inspection_worker() -> (Sender<PakInspectionJob>, Receiver<PakInspectionMessa
                         };
                         (inspection, archive)
                     })
-                    .map_err(|error| error.to_string());
+                    .map_err(|error| error.to_string())
+                });
                 if result_sender
                     .send(PakInspectionMessage::Finished(PakInspectionResult {
                         key: job.key,
@@ -2275,9 +2474,27 @@ fn inspection_worker() -> (Sender<PakInspectionJob>, Receiver<PakInspectionMessa
                     break;
                 }
             }
-        });
+        }));
     }
-    (request_sender, result_receiver)
+    (request_sender, result_receiver, worker_handles)
+}
+
+fn catch_inspection_job<T, F>(job: F) -> Result<T, String>
+where
+    F: FnOnce() -> Result<T, String>,
+{
+    catch_unwind(AssertUnwindSafe(job))
+        .map_err(inspection_panic_message)
+        .and_then(std::convert::identity)
+}
+
+fn inspection_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    let detail = payload
+        .downcast_ref::<&str>()
+        .map(|value| (*value).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown inspection error".to_owned());
+    format!("The Pak inspection worker stopped unexpectedly: {detail}")
 }
 
 fn worker_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -2290,7 +2507,7 @@ fn worker_panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 }
 
 fn path_key(path: &Path) -> String {
-    path.to_string_lossy().to_ascii_lowercase()
+    pak_merger::resources::path_identity_key(path)
 }
 
 fn friendly_inspection_error(error: &str, locale: UiLocale) -> String {
@@ -2423,8 +2640,8 @@ fn friendly_operation_error(error: &str, locale: UiLocale) -> &'static str {
         )
     } else if lower.contains("input pak changed") || lower.contains("input changed") {
         locale.tr(
-            "분석한 뒤 입력 Pak이 바뀌었습니다. 다시 분석하세요.",
-            "An input Pak changed after analysis. Analyze the Paks again.",
+            "입력 Pak이 변경되어 다시 확인하고 있습니다. Pak 확인이 끝나면 다시 분석하세요.",
+            "An input Pak changed and is being checked again. Wait for the Pak check to finish, then analyze again.",
         )
     } else if lower.contains("space") || lower.contains("memory") {
         locale.tr(
@@ -2639,6 +2856,7 @@ fn is_user_selectable_conflict(conflict: &Conflict) -> bool {
 fn fixed_encoding_drift_variant<'a>(
     conflict: &'a Conflict,
     carrier_input_id: &str,
+    input_order: &[InputDescriptor],
 ) -> Option<&'a Variant> {
     if !is_encoding_drift(conflict) {
         return None;
@@ -2647,7 +2865,14 @@ fn fixed_encoding_drift_variant<'a>(
         .variants
         .iter()
         .find(|variant| variant.input_id == carrier_input_id)
-        .or_else(|| conflict.variants.first())
+        .or_else(|| {
+            input_order.iter().find_map(|input| {
+                conflict
+                    .variants
+                    .iter()
+                    .find(|variant| variant.input_id == input.id)
+            })
+        })
 }
 
 fn selected_visible_conflict_index(
@@ -2740,7 +2965,7 @@ fn draw_compact_conflict_list(
                                 ui.label(format!(
                                     "{}: {}",
                                     locale.tr("선택", "Selected"),
-                                    provenance_file_name(variant)
+                                    variant_source_label(variant, &plan.inputs)
                                 ));
                             }
                         });
@@ -2758,6 +2983,7 @@ fn draw_conflict_detail(
     ui: &mut egui::Ui,
     conflict: &Conflict,
     carrier_input_id: &str,
+    inputs: &[InputDescriptor],
     resolutions: &ResolutionSet,
     locale: UiLocale,
     pending_choices: &mut Vec<(String, String)>,
@@ -2765,8 +2991,8 @@ fn draw_conflict_detail(
     let hierarchy = conflict_hierarchy(conflict, locale);
     let selected_id = resolutions.choices.get(&conflict.id).map(String::as_str);
     let resolved = conflict_is_resolved(conflict, resolutions);
-    let fixed_drift_id =
-        fixed_encoding_drift_variant(conflict, carrier_input_id).map(|variant| variant.id.as_str());
+    let fixed_drift_id = fixed_encoding_drift_variant(conflict, carrier_input_id, inputs)
+        .map(|variant| variant.id.as_str());
 
     egui::Frame::group(ui.style()).show(ui, |ui| {
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
@@ -2850,6 +3076,7 @@ fn draw_conflict_detail(
                     .show(ui, |ui| {
                         ui.horizontal_top(|ui| {
                             for variant in &conflict.variants {
+                                let source_label = variant_source_label(variant, inputs);
                                 let fixed = fixed_drift_id == Some(variant.id.as_str());
                                 let selected = if is_encoding_drift(conflict) {
                                     fixed
@@ -2885,10 +3112,13 @@ fn draw_conflict_detail(
                                     ui,
                                     &conflict.id,
                                     variant,
-                                    selected,
-                                    selection_enabled,
-                                    fixed_reason,
-                                    locale,
+                                    VariantCardDisplay {
+                                        source_label: &source_label,
+                                        selected,
+                                        selection_enabled,
+                                        fixed_reason,
+                                        locale,
+                                    },
                                 ) {
                                     pending_choices
                                         .push((conflict.id.clone(), variant.id.clone()));
@@ -2901,16 +3131,21 @@ fn draw_conflict_detail(
     });
 }
 
+struct VariantCardDisplay<'a> {
+    source_label: &'a str,
+    selected: bool,
+    selection_enabled: bool,
+    fixed_reason: Option<&'a str>,
+    locale: UiLocale,
+}
+
 fn draw_variant_card(
     ui: &mut egui::Ui,
     conflict_id: &str,
     variant: &Variant,
-    selected: bool,
-    selection_enabled: bool,
-    fixed_reason: Option<&str>,
-    locale: UiLocale,
+    display: VariantCardDisplay<'_>,
 ) -> bool {
-    let fill = if selected {
+    let fill = if display.selected {
         egui::Color32::from_rgb(43, 70, 92)
     } else {
         egui::Color32::from_rgb(31, 34, 40)
@@ -2922,18 +3157,23 @@ fn draw_variant_card(
         ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
             let full_input_path = variant.provenance.input_path.display().to_string();
             let source_name = provenance_file_name(variant);
-            let title = if source_name.eq_ignore_ascii_case(&variant.label) {
-                source_name.clone()
+            let title = if source_name.eq_ignore_ascii_case(&variant.label)
+                || display.source_label.eq_ignore_ascii_case(&variant.label)
+            {
+                display.source_label.to_owned()
             } else {
-                format!("{source_name} · {}", variant.label)
+                format!("{} · {}", display.source_label, variant.label)
             };
-            if selection_enabled {
+            if display.selection_enabled {
                 let button_width = ui.available_width();
                 let response = ui
                     .add_sized(
                         [button_width, 28.0],
-                        egui::Button::selectable(selected, egui::RichText::new(&title).strong())
-                            .wrap_mode(egui::TextWrapMode::Truncate),
+                        egui::Button::selectable(
+                            display.selected,
+                            egui::RichText::new(&title).strong(),
+                        )
+                        .wrap_mode(egui::TextWrapMode::Truncate),
                     )
                     .on_hover_text(&full_input_path);
                 clicked = response.clicked();
@@ -2941,62 +3181,68 @@ fn draw_variant_card(
                 ui.add(egui::Label::new(egui::RichText::new(&title).strong()).truncate())
                     .on_hover_text(&full_input_path);
             }
-            if let Some(reason) = fixed_reason {
+            if let Some(reason) = display.fixed_reason {
                 ui.add(
                     egui::Label::new(egui::RichText::new(reason).color(egui::Color32::LIGHT_BLUE))
                         .wrap(),
                 );
             }
             ui.separator();
-            ui.small(locale.tr("들어 있는 값", "Value in this Pak"));
+            ui.small(display.locale.tr("들어 있는 값", "Value in this Pak"));
             let preview = value_preview(&variant.preview);
             ui.add(
                 egui::Label::new(egui::RichText::new(truncate(&preview, 240)).monospace()).wrap(),
             )
             .on_hover_text(&preview);
-            egui::CollapsingHeader::new(locale.tr("문제 해결용 정보", "Troubleshooting details"))
-                .id_salt(("variant-troubleshooting-details", conflict_id, &variant.id))
-                .default_open(false)
-                .show(ui, |ui| {
-                    let marker = format!(
-                        "{}: {}",
-                        locale.tr("내부 저장 코드", "Internal storage code"),
-                        variant.marker
-                    );
-                    ui.add(egui::Label::new(egui::RichText::new(&marker).small()).truncate())
-                        .on_hover_text(&marker);
-                    ui.small(format!(
-                        "{}: {}",
-                        locale.tr("저장 데이터 확인값", "Stored-data check"),
-                        &variant.raw_sha256[..variant.raw_sha256.len().min(16)]
-                    ));
-                    ui.small(format!(
-                        "{}: {}",
-                        locale.tr("값 비교용 확인값", "Value comparison check"),
-                        &variant.semantic_sha256[..variant.semantic_sha256.len().min(16)]
-                    ));
-                    let input_id = format!(
-                        "{}: {}",
-                        locale.tr("Pak 식별값", "Pak ID"),
-                        variant.provenance.input_id
-                    );
-                    ui.add(egui::Label::new(egui::RichText::new(&input_id).small()).truncate())
-                        .on_hover_text(&input_id);
-                    if let Some(entry_path) = &variant.provenance.entry_path {
-                        let entry_name = path_leaf(entry_path);
-                        ui.add(
-                            egui::Label::new(
-                                egui::RichText::new(format!(
-                                    "{}: {entry_name}",
-                                    locale.tr("Pak 내부 파일", "File in Pak")
-                                ))
-                                .small(),
-                            )
-                            .truncate(),
+            egui::CollapsingHeader::new(
+                display
+                    .locale
+                    .tr("문제 해결용 정보", "Troubleshooting details"),
+            )
+            .id_salt(("variant-troubleshooting-details", conflict_id, &variant.id))
+            .default_open(false)
+            .show(ui, |ui| {
+                let marker = format!(
+                    "{}: {}",
+                    display.locale.tr("내부 저장 코드", "Internal storage code"),
+                    variant.marker
+                );
+                ui.add(egui::Label::new(egui::RichText::new(&marker).small()).truncate())
+                    .on_hover_text(&marker);
+                ui.small(format!(
+                    "{}: {}",
+                    display.locale.tr("저장 데이터 확인값", "Stored-data check"),
+                    &variant.raw_sha256[..variant.raw_sha256.len().min(16)]
+                ));
+                ui.small(format!(
+                    "{}: {}",
+                    display
+                        .locale
+                        .tr("값 비교용 확인값", "Value comparison check"),
+                    &variant.semantic_sha256[..variant.semantic_sha256.len().min(16)]
+                ));
+                let input_id = format!(
+                    "{}: {}",
+                    display.locale.tr("Pak 식별값", "Pak ID"),
+                    variant.provenance.input_id
+                );
+                ui.add(egui::Label::new(egui::RichText::new(&input_id).small()).truncate())
+                    .on_hover_text(&input_id);
+                if let Some(entry_path) = &variant.provenance.entry_path {
+                    let entry_name = path_leaf(entry_path);
+                    ui.add(
+                        egui::Label::new(
+                            egui::RichText::new(format!(
+                                "{}: {entry_name}",
+                                display.locale.tr("Pak 내부 파일", "File in Pak")
+                            ))
+                            .small(),
                         )
-                        .on_hover_text(entry_path);
-                    }
-                });
+                        .truncate(),
+                    )
+                    .on_hover_text(entry_path);
+                }
+            });
         });
     });
     clicked
@@ -3012,13 +3258,126 @@ fn provenance_file_name(variant: &Variant) -> String {
     }
 }
 
+fn input_display_label(input: &InputDescriptor, inputs: &[InputDescriptor]) -> String {
+    let file_name = input
+        .path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .filter(|value| !value.is_empty())
+        .unwrap_or(&input.display_name);
+    let duplicate_name = inputs.iter().filter(|other| {
+        other
+            .path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&other.display_name)
+            .eq_ignore_ascii_case(file_name)
+    });
+    if duplicate_name.count() < 2 {
+        return file_name.to_owned();
+    }
+    let parent = input
+        .path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| input.path.display().to_string());
+    format!("{file_name} — {parent}")
+}
+
+fn variant_source_label(variant: &Variant, inputs: &[InputDescriptor]) -> String {
+    inputs
+        .iter()
+        .find(|input| input.id == variant.input_id)
+        .map(|input| input_display_label(input, inputs))
+        .unwrap_or_else(|| provenance_file_name(variant))
+}
+
 fn path_leaf(path: &str) -> &str {
     path.rsplit(['/', '\\']).next().unwrap_or(path)
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
+    pak_merger::resources::same_file_path(left, right)
+}
+
+fn preflight_pak_addition(
+    existing_paths: &[PathBuf],
+    candidate: &Path,
+) -> Result<(), InputAdmissionError> {
+    let input_count = existing_paths.len().saturating_add(1);
+    validate_input_limits(input_count, 0)?;
+    let mut total = 0_u64;
+    for path in existing_paths
+        .iter()
+        .map(PathBuf::as_path)
+        .chain(std::iter::once(candidate))
+    {
+        let metadata =
+            std::fs::metadata(path).map_err(|error| InputAdmissionError::SizeUnavailable {
+                path: path.to_path_buf(),
+                reason: error.to_string(),
+            })?;
+        if !metadata.is_file() {
+            return Err(InputAdmissionError::SizeUnavailable {
+                path: path.to_path_buf(),
+                reason: "the path is not a regular file".to_owned(),
+            });
+        }
+        total = total
+            .checked_add(metadata.len())
+            .ok_or(InputAdmissionError::TotalTooLarge { total: u64::MAX })?;
+        validate_input_limits(input_count, total)?;
+    }
+    Ok(())
+}
+
+fn validate_input_limits(input_count: usize, total_bytes: u64) -> Result<(), InputAdmissionError> {
+    if input_count > MAX_SUPPORTED_PAKS {
+        return Err(InputAdmissionError::TooMany);
+    }
+    if total_bytes > MAX_SUPPORTED_TOTAL_BYTES {
+        return Err(InputAdmissionError::TotalTooLarge { total: total_bytes });
+    }
+    Ok(())
+}
+
+fn input_admission_message(error: &InputAdmissionError, locale: UiLocale) -> String {
+    match (error, locale) {
+        (InputAdmissionError::TooMany, UiLocale::Korean) => {
+            format!("입력 Pak은 최대 {MAX_SUPPORTED_PAKS}개까지 추가할 수 있습니다.")
+        }
+        (InputAdmissionError::TooMany, UiLocale::English) => {
+            format!("You can add at most {MAX_SUPPORTED_PAKS} input Paks.")
+        }
+        (InputAdmissionError::TooMany, UiLocale::Japanese) => {
+            format!("入力 Pak は最大 {MAX_SUPPORTED_PAKS} 個まで追加できます。")
+        }
+        (InputAdmissionError::TotalTooLarge { total }, UiLocale::Korean) => format!(
+            "입력 Pak의 총 크기 {}가 지원 한도 {}를 넘습니다.",
+            format_bytes(*total),
+            format_bytes(MAX_SUPPORTED_TOTAL_BYTES)
+        ),
+        (InputAdmissionError::TotalTooLarge { total }, UiLocale::English) => format!(
+            "The input Paks total {}, exceeding the supported limit of {}.",
+            format_bytes(*total),
+            format_bytes(MAX_SUPPORTED_TOTAL_BYTES)
+        ),
+        (InputAdmissionError::TotalTooLarge { total }, UiLocale::Japanese) => format!(
+            "入力 Pak の合計サイズ {} が対応上限 {} を超えています。",
+            format_bytes(*total),
+            format_bytes(MAX_SUPPORTED_TOTAL_BYTES)
+        ),
+        (InputAdmissionError::SizeUnavailable { path, .. }, UiLocale::Korean) => {
+            format!("Pak 파일 크기를 확인할 수 없습니다: {}", path.display())
+        }
+        (InputAdmissionError::SizeUnavailable { path, .. }, UiLocale::English) => {
+            format!("The Pak file size could not be checked: {}", path.display())
+        }
+        (InputAdmissionError::SizeUnavailable { path, .. }, UiLocale::Japanese) => {
+            format!("Pak ファイルのサイズを確認できません: {}", path.display())
+        }
+    }
 }
 
 fn conflict_matches_filter(conflict: &Conflict, needle: &str) -> bool {
@@ -3108,13 +3467,12 @@ pub fn run() -> anyhow::Result<()> {
         PRODUCT_NAME,
         options,
         Box::new(|context| {
-            let cjk_font_available = install_windows_cjk_fonts(&context.egui_ctx);
-            let mut app = MergerApp {
-                cjk_font_available,
-                ..MergerApp::default()
-            };
-            if !matches!(app.locale, UiLocale::English) && !cjk_font_available {
+            let mut app = MergerApp::default();
+            app.korean_font_available = locale_font_available(UiLocale::Korean);
+            app.japanese_font_available = locale_font_available(UiLocale::Japanese);
+            if !configure_locale_fonts(&context.egui_ctx, app.locale) {
                 app.locale = UiLocale::English;
+                let _ = configure_locale_fonts(&context.egui_ctx, UiLocale::English);
                 app.status = "A Windows CJK font could not be found, so the app is using English."
                     .to_owned();
             }
@@ -3124,7 +3482,18 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
-fn install_windows_cjk_fonts(context: &egui::Context) -> bool {
+fn locale_font_candidates(locale: UiLocale) -> &'static [&'static str] {
+    match locale {
+        UiLocale::Korean => &["malgun.ttf", "malgunsl.ttf"],
+        UiLocale::Japanese => &["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"],
+        UiLocale::English => &[],
+    }
+}
+
+fn locale_font_available(locale: UiLocale) -> bool {
+    if matches!(locale, UiLocale::English) {
+        return true;
+    }
     #[cfg(windows)]
     {
         const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
@@ -3132,44 +3501,58 @@ fn install_windows_cjk_fonts(context: &egui::Context) -> bool {
             return false;
         };
         let fonts_root = PathBuf::from(windows_root).join("Fonts");
-        let mut fonts = egui::FontDefinitions::default();
-        let mut loaded = Vec::new();
-        for file_name in [
-            "malgun.ttf",
-            "malgunbd.ttf",
-            "YuGothM.ttc",
-            "YuGothR.ttc",
-            "meiryo.ttc",
-            "meiryob.ttc",
-            "msgothic.ttc",
-        ] {
+        locale_font_candidates(locale).iter().any(|file_name| {
+            std::fs::metadata(fonts_root.join(file_name)).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.len() != 0 && metadata.len() <= MAX_SYSTEM_FONT_BYTES
+            })
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+fn configure_locale_fonts(context: &egui::Context, locale: UiLocale) -> bool {
+    let mut fonts = egui::FontDefinitions::default();
+    if matches!(locale, UiLocale::English) {
+        context.set_fonts(fonts);
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
+        let Some(windows_root) = std::env::var_os("WINDIR") else {
+            return false;
+        };
+        let fonts_root = PathBuf::from(windows_root).join("Fonts");
+        for file_name in locale_font_candidates(locale) {
             let path = fonts_root.join(file_name);
             let Ok(metadata) = std::fs::metadata(&path) else {
                 continue;
             };
-            if metadata.len() == 0 || metadata.len() > MAX_SYSTEM_FONT_BYTES {
+            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_SYSTEM_FONT_BYTES
+            {
                 continue;
             }
             let Ok(bytes) = std::fs::read(path) else {
                 continue;
             };
-            let name = format!("windows-cjk-{file_name}");
+            let name = format!("windows-locale-{file_name}");
             fonts
                 .font_data
                 .insert(name.clone(), egui::FontData::from_owned(bytes).into());
-            loaded.push(name);
-        }
-        if loaded.is_empty() {
-            return false;
-        }
-        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-            let chain = fonts.families.entry(family).or_default();
-            for (index, name) in loaded.iter().enumerate() {
-                chain.insert(index, name.clone());
+            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+                fonts
+                    .families
+                    .entry(family)
+                    .or_default()
+                    .insert(0, name.clone());
             }
+            context.set_fonts(fonts);
+            return true;
         }
-        context.set_fonts(fonts);
-        true
+        false
     }
     #[cfg(not(windows))]
     {
@@ -3183,6 +3566,7 @@ mod tests {
     use super::*;
     use pak_merger::types::{ConflictKind, Provenance, Variant};
     use std::io::Cursor;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn conflict(id: &str, asset: &str, input_id: &str) -> Conflict {
         Conflict {
@@ -3211,6 +3595,24 @@ mod tests {
         }
     }
 
+    fn input_descriptor(id: &str, path: impl Into<PathBuf>) -> InputDescriptor {
+        let path = path.into();
+        InputDescriptor {
+            id: id.to_owned(),
+            display_name: path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or(id)
+                .to_owned(),
+            path,
+            sha256: id.repeat(64 / id.len().max(1)),
+            size: 1,
+            pak_version: Some(11),
+            mount_point: Some("../../../Game/Content/".to_owned()),
+            entry_count: Some(1),
+        }
+    }
+
     fn plan(conflicts: Vec<Conflict>) -> MergePlan {
         MergePlan {
             schema_version: 1,
@@ -3232,12 +3634,10 @@ mod tests {
     }
 
     fn app_for_logic_tests() -> MergerApp {
-        let mut app = MergerApp {
-            locale: UiLocale::English,
-            consent_valid: false,
-            pak_paths: vec![PathBuf::from("A.pak"), PathBuf::from("B.pak")],
-            ..MergerApp::default()
-        };
+        let mut app = MergerApp::default();
+        app.locale = UiLocale::English;
+        app.consent_valid = false;
+        app.pak_paths = vec![PathBuf::from("A.pak"), PathBuf::from("B.pak")];
         app.invalidate_analysis();
         app.status.clear();
         app
@@ -3289,6 +3689,14 @@ mod tests {
         assert!(
             friendly_operation_error("operation cancelled", UiLocale::Japanese)
                 .contains("キャンセル")
+        );
+        assert!(
+            UiLocale::Japanese
+                .tr(
+                    "입력 Pak이 변경되어 다시 확인하고 있습니다. Pak 확인이 끝나면 다시 분석하세요.",
+                    "An input Pak changed and is being checked again. Wait for the Pak check to finish, then analyze again."
+                )
+                .contains("再確認")
         );
     }
 
@@ -3396,6 +3804,35 @@ mod tests {
             updates,
             vec![("skill".to_owned(), "variant-skill".to_owned())]
         );
+    }
+
+    #[test]
+    fn pending_bulk_count_tracks_current_resolutions_and_filter() {
+        let plan = plan(vec![
+            conflict("skill-one", "SkillID.uexp", "A"),
+            conflict("skill-two", "SkillAvailID.uexp", "A"),
+            conflict("enemy", "EnemyID.uexp", "A"),
+        ]);
+        let mut app = app_for_logic_tests();
+        app.plan = Some(Arc::new(plan));
+        app.pending_bulk = Some(PendingBulkSelection {
+            input_id: "A".to_owned(),
+            display_name: "A.pak".to_owned(),
+            filter: String::new(),
+            count: 99,
+        });
+
+        app.refresh_pending_bulk("skill");
+        assert_eq!(app.pending_bulk.as_ref().unwrap().count, 2);
+        assert_eq!(app.pending_bulk.as_ref().unwrap().filter, "skill");
+
+        app.choose_variant("skill-one", "variant-skill-one");
+        app.refresh_pending_bulk("skill");
+        assert_eq!(app.pending_bulk.as_ref().unwrap().count, 1);
+
+        app.choose_variant("skill-two", "variant-skill-two");
+        app.refresh_pending_bulk("skill");
+        assert!(app.pending_bulk.is_none());
     }
 
     #[test]
@@ -3521,13 +3958,61 @@ mod tests {
     #[test]
     fn adding_a_pak_immediately_queues_read_only_inspection() {
         let mut app = app_for_logic_tests();
-        let path = PathBuf::from("Queued.pak");
+        app.pak_paths.clear();
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("Queued.pak");
+        std::fs::write(&path, b"not a Pak").unwrap();
 
         app.add_path(path.clone());
 
         let cached = app.inspections.get(&path_key(&path)).unwrap();
         assert_eq!(cached.status, PakInspectionStatus::Pending);
         assert!(cached.generation > 0);
+    }
+
+    #[test]
+    fn input_admission_enforces_count_and_total_size_boundaries() {
+        assert!(validate_input_limits(MAX_SUPPORTED_PAKS, MAX_SUPPORTED_TOTAL_BYTES).is_ok());
+        assert_eq!(
+            validate_input_limits(MAX_SUPPORTED_PAKS + 1, 0).unwrap_err(),
+            InputAdmissionError::TooMany
+        );
+        assert_eq!(
+            validate_input_limits(1, MAX_SUPPORTED_TOTAL_BYTES + 1).unwrap_err(),
+            InputAdmissionError::TotalTooLarge {
+                total: MAX_SUPPORTED_TOTAL_BYTES + 1
+            }
+        );
+    }
+
+    #[test]
+    fn add_path_rejects_unreadable_sizes_with_a_specific_status() {
+        let mut app = app_for_logic_tests();
+        app.pak_paths.clear();
+        let path = PathBuf::from("missing-input.pak");
+
+        app.add_path(path);
+
+        assert!(app.pak_paths.is_empty());
+        assert!(app.status.contains("size could not be checked"));
+        assert!(app.status_detail.is_some());
+    }
+
+    #[test]
+    fn add_path_deduplicates_filesystem_aliases() {
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("Original.pak");
+        let alias = directory.path().join("Alias.pak");
+        std::fs::write(&original, b"not a Pak").unwrap();
+        std::fs::hard_link(&original, &alias).unwrap();
+        let mut app = app_for_logic_tests();
+        app.pak_paths.clear();
+
+        app.add_path(original);
+        app.add_path(alias);
+
+        assert_eq!(app.pak_paths.len(), 1);
+        assert_eq!(app.inspections.len(), 1);
     }
 
     #[test]
@@ -3600,6 +4085,131 @@ mod tests {
             app.inspections.get(&key).unwrap().status,
             PakInspectionStatus::Failed("unsupported version".to_owned())
         );
+    }
+
+    #[test]
+    fn inspection_panics_become_failures_and_do_not_escape_the_job_loop() {
+        let failure = catch_inspection_job::<(), _>(|| panic!("inspection boom")).unwrap_err();
+        assert!(failure.contains("inspection worker"));
+        assert!(failure.contains("inspection boom"));
+
+        let next = catch_inspection_job(|| Ok::<_, String>(7)).unwrap();
+        assert_eq!(next, 7);
+    }
+
+    #[test]
+    fn input_changed_failures_are_typed_and_requeue_every_selected_inspection() {
+        let failure = WorkerFailure::from_merge_error(pak_merger::merge::MergeError::InputChanged(
+            PathBuf::from("A.pak"),
+        ));
+        assert_eq!(failure.kind, WorkerFailureKind::InputChanged);
+
+        let directory = tempfile::tempdir().unwrap();
+        let paths = [
+            directory.path().join("A.pak"),
+            directory.path().join("B.pak"),
+        ];
+        for path in &paths {
+            std::fs::write(path, b"changed").unwrap();
+        }
+        let mut app = app_for_logic_tests();
+        app.pak_paths = paths.to_vec();
+        app.inspections.clear();
+        app.next_inspection_generation = 10;
+        app.plan = Some(Arc::new(plan(Vec::new())));
+        let mut old_tokens = Vec::new();
+        for path in &paths {
+            let cancellation = pak_merger::CancellationToken::new();
+            old_tokens.push(cancellation.clone());
+            app.inspections.insert(
+                path_key(path),
+                CachedPakInspection {
+                    generation: 1,
+                    status: PakInspectionStatus::Failed("stale".to_owned()),
+                    archive: None,
+                    progress: None,
+                    cancellation,
+                },
+            );
+        }
+
+        app.recover_from_changed_input(failure.message);
+
+        assert!(old_tokens.iter().all(|token| token.is_cancelled()));
+        assert!(app.plan.is_none());
+        assert!(app.status.contains("being checked again"));
+        for path in &paths {
+            let cached = app.inspections.get(&path_key(path)).unwrap();
+            assert!(cached.generation > 1);
+            assert_eq!(cached.status, PakInspectionStatus::Pending);
+        }
+    }
+
+    #[test]
+    fn polling_a_finished_operation_joins_its_worker_thread() {
+        let mut app = app_for_logic_tests();
+        let (sender, receiver) = mpsc::channel();
+        sender
+            .send(WorkerMessage::Finished(Err(WorkerFailure {
+                kind: WorkerFailureKind::Other,
+                message: "test failure".to_owned(),
+            })))
+            .unwrap();
+        drop(sender);
+        app.worker = Some(receiver);
+        app.worker_handle = Some(std::thread::spawn(|| {}));
+
+        app.poll_worker();
+
+        assert!(app.worker.is_none());
+        assert!(app.worker_handle.is_none());
+    }
+
+    #[test]
+    fn shutdown_cancels_active_and_inspection_work_before_joining() {
+        let mut app = app_for_logic_tests();
+        let operation_cancellation = pak_merger::CancellationToken::new();
+        let worker_cancellation = operation_cancellation.clone();
+        let worker_finished = Arc::new(AtomicBool::new(false));
+        let worker_finished_clone = Arc::clone(&worker_finished);
+        app.cancel_signal = Some(operation_cancellation);
+        app.worker_handle = Some(std::thread::spawn(move || {
+            while !worker_cancellation.is_cancelled() {
+                std::thread::yield_now();
+            }
+            worker_finished_clone.store(true, Ordering::Release);
+        }));
+        let inspection_cancellation = pak_merger::CancellationToken::new();
+        let inspection_worker_cancellation = inspection_cancellation.clone();
+        let inspection_worker_finished = Arc::new(AtomicBool::new(false));
+        let inspection_worker_finished_clone = Arc::clone(&inspection_worker_finished);
+        app.inspection_worker_handles
+            .push(std::thread::spawn(move || {
+                while !inspection_worker_cancellation.is_cancelled() {
+                    std::thread::yield_now();
+                }
+                inspection_worker_finished_clone.store(true, Ordering::Release);
+            }));
+        app.inspections.insert(
+            "inspection".to_owned(),
+            CachedPakInspection {
+                generation: 1,
+                status: PakInspectionStatus::Pending,
+                archive: None,
+                progress: None,
+                cancellation: inspection_cancellation.clone(),
+            },
+        );
+
+        app.shutdown_background_work();
+
+        assert!(inspection_cancellation.is_cancelled());
+        assert!(worker_finished.load(Ordering::Acquire));
+        assert!(inspection_worker_finished.load(Ordering::Acquire));
+        assert!(app.worker_handle.is_none());
+        assert!(app.inspection_requests.is_none());
+        assert!(app.inspection_worker_handles.is_empty());
+        assert!(app.cancel_signal.is_none());
     }
 
     #[test]
@@ -3795,7 +4405,7 @@ mod tests {
 
         assert!(!is_user_selectable_conflict(&drift));
         assert_eq!(
-            fixed_encoding_drift_variant(&drift, "B").map(|variant| variant.id.as_str()),
+            fixed_encoding_drift_variant(&drift, "B", &[]).map(|variant| variant.id.as_str()),
             Some("carrier-variant")
         );
 
@@ -3803,5 +4413,79 @@ mod tests {
         drift.blocking = true;
         let plan = plan(vec![drift]);
         assert!(collect_bulk_updates(&plan, &ResolutionSet::default(), "A", "").is_empty());
+    }
+
+    #[test]
+    fn encoding_drift_without_carrier_uses_plan_input_order_not_variant_order() {
+        let mut drift = conflict("drift-order", "SkillID.uexp", "A");
+        drift.kind = ConflictKind::EncodingDrift;
+        drift.blocking = false;
+        drift.variants[0].id = "variant-a".to_owned();
+        let mut variant_b = drift.variants[0].clone();
+        variant_b.id = "variant-b".to_owned();
+        variant_b.input_id = "B".to_owned();
+        variant_b.provenance.input_id = "B".to_owned();
+        drift.variants.push(variant_b);
+        let inputs = vec![
+            input_descriptor("B", "C:/Mods/B.pak"),
+            input_descriptor("A", "C:/Mods/A.pak"),
+        ];
+
+        assert_eq!(
+            fixed_encoding_drift_variant(&drift, "missing-carrier", &inputs)
+                .map(|variant| variant.id.as_str()),
+            Some("variant-b")
+        );
+    }
+
+    #[test]
+    fn duplicate_basenames_include_parent_paths_in_bulk_and_variant_labels() {
+        let inputs = vec![
+            input_descriptor("A", "C:/Mods/First/Same_P.pak"),
+            input_descriptor("B", "C:/Mods/Second/Same_P.pak"),
+            input_descriptor("C", "C:/Mods/Unique_P.pak"),
+        ];
+        let first = input_display_label(&inputs[0], &inputs);
+        let second = input_display_label(&inputs[1], &inputs);
+        assert_ne!(first, second);
+        assert!(first.contains("First"));
+        assert!(second.contains("Second"));
+        assert_eq!(input_display_label(&inputs[2], &inputs), "Unique_P.pak");
+
+        let variant = conflict("source", "Asset.uexp", "A").variants.remove(0);
+        assert_eq!(variant_source_label(&variant, &inputs), first);
+    }
+
+    #[test]
+    fn completed_merge_keeps_reference_check_notes_until_analysis_is_invalidated() {
+        let mut app = app_for_logic_tests();
+        app.complete_merge(
+            PathBuf::from("Merged_P.pak"),
+            vec!["Other game-specific links may still need in-game testing.".to_owned()],
+        );
+
+        assert_eq!(app.completed_output, Some(PathBuf::from("Merged_P.pak")));
+        assert_eq!(app.completed_reference_warnings.len(), 1);
+
+        app.invalidate_analysis();
+        assert!(app.completed_reference_warnings.is_empty());
+    }
+
+    #[test]
+    fn locale_font_candidates_are_minimal_and_language_specific() {
+        assert!(locale_font_candidates(UiLocale::English).is_empty());
+        assert_eq!(
+            locale_font_candidates(UiLocale::Korean),
+            &["malgun.ttf", "malgunsl.ttf"]
+        );
+        assert_eq!(
+            locale_font_candidates(UiLocale::Japanese),
+            &["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"]
+        );
+        assert!(
+            !locale_font_candidates(UiLocale::Korean)
+                .iter()
+                .any(|name| locale_font_candidates(UiLocale::Japanese).contains(name))
+        );
     }
 }

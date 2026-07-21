@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{File, OpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::io::{self, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -43,14 +43,9 @@ pub const MAX_IN_MEMORY_ENTRY_BYTES: u64 = usize::MAX as u64;
 pub const COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// Small decoded entries stay in RAM; larger entries use temporary mappings.
 const DECODED_MEMORY_CACHE_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
-const MINIMUM_DECODE_DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MINIMUM_DECODE_DISK_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 /// Oodle output is streamed in blocks and has no separate heap limit.
 pub const MAX_OODLE_OUTPUT_ENTRY_BYTES: u64 = usize::MAX as u64;
-#[cfg(windows)]
-const OODLE_RUNTIME_FILE_NAME: &str = "oo2core_9_win64.dll";
-#[cfg(windows)]
-const OODLE_RUNTIME_SHA256: &str =
-    "6f5d41a7892ea6b2db420f2458dad2f84a63901c9a93ce9497337b16c195f457";
 const MAX_STALE_HASH_UASSET_BYTES: u64 = 64 * 1024 * 1024;
 /// Structural guard for legacy v3-v9 block tables. Two million standard
 /// 126,976-byte blocks cover far more than the supported 128 GiB input set,
@@ -69,6 +64,23 @@ struct DecodeCachePolicy {
     cache_directory: Option<PathBuf>,
     #[cfg(test)]
     cancel_after_disk_reservation: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogicalValidation {
+    Deferred,
+    StrictRetain,
+    StrictDiscard,
+}
+
+impl LogicalValidation {
+    fn is_strict(self) -> bool {
+        self != Self::Deferred
+    }
+
+    fn retains_decoded_entries(self) -> bool {
+        self == Self::StrictRetain
+    }
 }
 
 impl DecodeCachePolicy {
@@ -270,6 +282,16 @@ pub struct PackageGroup {
 pub struct PackageGrouping {
     pub packages: Vec<PackageGroup>,
     pub loose_entries: Vec<String>,
+}
+
+/// Read-only information used to estimate the cost of decoding a selected
+/// entry before a merge starts. The query never reads or decodes payload data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PakEntryDecodeInfo {
+    pub compressed: bool,
+    pub logical_size: u64,
+    pub decoded_cache_present: bool,
+    pub memory_cache_eligible: bool,
 }
 
 #[derive(Debug)]
@@ -477,7 +499,13 @@ impl PakArchive {
     /// later reference checks or output reads do not decode them again.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let cancellation = CancellationToken::new();
-        Self::open_internal(path.as_ref(), true, true, &cancellation, &mut |_| {})
+        Self::open_internal(
+            path.as_ref(),
+            LogicalValidation::StrictRetain,
+            true,
+            &cancellation,
+            &mut |_| {},
+        )
     }
 
     /// Opens an input archive without eagerly decoding every compressed file.
@@ -486,7 +514,13 @@ impl PakArchive {
     /// Logical bytes are decoded and cached only when requested.
     pub fn open_fast(path: impl AsRef<Path>) -> Result<Self> {
         let cancellation = CancellationToken::new();
-        Self::open_internal(path.as_ref(), false, true, &cancellation, &mut |_| {})
+        Self::open_internal(
+            path.as_ref(),
+            LogicalValidation::Deferred,
+            true,
+            &cancellation,
+            &mut |_| {},
+        )
     }
 
     pub fn open_with_progress_and_cancel<C>(
@@ -497,7 +531,13 @@ impl PakArchive {
     where
         C: FnMut(PakOpenProgress),
     {
-        Self::open_internal(path.as_ref(), true, true, cancellation, &mut progress)
+        Self::open_internal(
+            path.as_ref(),
+            LogicalValidation::StrictRetain,
+            true,
+            cancellation,
+            &mut progress,
+        )
     }
 
     pub fn open_fast_with_progress_and_cancel<C>(
@@ -508,7 +548,13 @@ impl PakArchive {
     where
         C: FnMut(PakOpenProgress),
     {
-        Self::open_internal(path.as_ref(), false, true, cancellation, &mut progress)
+        Self::open_internal(
+            path.as_ref(),
+            LogicalValidation::Deferred,
+            true,
+            cancellation,
+            &mut progress,
+        )
     }
 
     pub fn open_with_progress_cancel_and_threads<C>(
@@ -522,7 +568,7 @@ impl PakArchive {
     {
         Self::open_internal(
             path.as_ref(),
-            true,
+            LogicalValidation::StrictRetain,
             multithreaded,
             cancellation,
             &mut progress,
@@ -540,7 +586,7 @@ impl PakArchive {
     {
         Self::open_internal(
             path.as_ref(),
-            false,
+            LogicalValidation::Deferred,
             multithreaded,
             cancellation,
             &mut progress,
@@ -549,14 +595,14 @@ impl PakArchive {
 
     fn open_internal(
         path: &Path,
-        strict_logical: bool,
+        logical_validation: LogicalValidation,
         multithreaded: bool,
         cancellation: &CancellationToken,
         progress: &mut dyn FnMut(PakOpenProgress),
     ) -> Result<Self> {
         Self::open_internal_with_policy(
             path,
-            strict_logical,
+            logical_validation,
             multithreaded,
             cancellation,
             progress,
@@ -566,7 +612,7 @@ impl PakArchive {
 
     fn open_internal_with_policy(
         path: &Path,
-        strict_logical: bool,
+        logical_validation: LogicalValidation,
         multithreaded: bool,
         cancellation: &CancellationToken,
         progress: &mut dyn FnMut(PakOpenProgress),
@@ -590,7 +636,7 @@ impl PakArchive {
         let mut parsed = parse_and_validate_indexes(&mut file, &detected)?;
 
         if let Some(entry) = parsed.entries.values().find(|entry| entry.oodle_compressed) {
-            prepare_oodle_support(&entry.path)?;
+            prepare_oodle_support(&entry.path, Some(cancellation))?;
         }
 
         // Keep repak as a second, independently maintained parser and use its
@@ -646,7 +692,7 @@ impl PakArchive {
             .filter(|entry| entry.compressed)
             .try_fold(0_u64, |total, entry| total.checked_add(entry.size))
             .ok_or_else(|| PakError::Corrupt("compressed file sizes overflow".to_owned()))?;
-        let total_work_bytes = if strict_logical {
+        let total_work_bytes = if logical_validation.is_strict() {
             archive_size
                 .checked_add(compressed_logical_bytes)
                 .ok_or_else(|| PakError::Corrupt("verification size overflow".to_owned()))?
@@ -714,7 +760,7 @@ impl PakArchive {
         let mut initial_decode_count = 0_usize;
         let mut decoded_bytes = 0_u64;
         for (key, entry) in &parsed.entries {
-            if entry.compressed && strict_logical {
+            if entry.compressed && logical_validation.is_strict() {
                 check_cancelled(cancellation)?;
                 let entry_base = archive_size.checked_add(decoded_bytes).ok_or_else(|| {
                     PakError::Corrupt("verification progress overflow".to_owned())
@@ -754,10 +800,12 @@ impl PakArchive {
                     &mut entry_progress,
                 )?);
                 logical_sha256.insert(key.clone(), cached.sha256);
-                *decoded_entries[key].lock().map_err(|_| {
-                    PakError::Corrupt("the decoded-file cache is unavailable".to_owned())
-                })? = Some(cached);
-                initial_decode_count = initial_decode_count.saturating_add(1);
+                if logical_validation.retains_decoded_entries() {
+                    *decoded_entries[key].lock().map_err(|_| {
+                        PakError::Corrupt("the decoded-file cache is unavailable".to_owned())
+                    })? = Some(cached);
+                    initial_decode_count = initial_decode_count.saturating_add(1);
+                }
                 decoded_bytes = decoded_bytes.checked_add(entry.size).ok_or_else(|| {
                     PakError::Corrupt("verification progress overflow".to_owned())
                 })?;
@@ -765,7 +813,7 @@ impl PakArchive {
                 logical_sha256.insert(key.clone(), entry.stored_sha256);
             }
         }
-        if strict_logical && compressed_logical_bytes != 0 {
+        if logical_validation.is_strict() && compressed_logical_bytes != 0 {
             progress(PakOpenProgress::Decoding {
                 completed_bytes: total_work_bytes,
                 total_bytes: total_work_bytes,
@@ -773,10 +821,15 @@ impl PakArchive {
             });
         }
 
-        let mut inventory_entries = Vec::with_capacity(parsed.entries.len());
+        let mut inventory_entries = Vec::new();
+        inventory_entries
+            .try_reserve_exact(parsed.entries.len())
+            .map_err(|_| {
+                PakError::UnsupportedLayout("the Pak inventory is too large to allocate".to_owned())
+            })?;
         for (key, entry) in &parsed.entries {
             let payload_sha1 = payload_hashes[key].0;
-            let sha256_is_logical = !entry.compressed || strict_logical;
+            let sha256_is_logical = !entry.compressed || logical_validation.is_strict();
             let sha256 = logical_sha256
                 .get(key)
                 .copied()
@@ -883,6 +936,40 @@ impl PakArchive {
             .get(&key)
             .map(|entry| entry.size)
             .ok_or(PakError::MissingEntry(normalized))
+    }
+
+    /// Returns decode-cache metadata without touching the entry payload.
+    pub fn entry_decode_info(&self, path: &str) -> Result<PakEntryDecodeInfo> {
+        let normalized = normalize_entry_path(path)?;
+        let key = normalized_sort_key(&normalized);
+        let entry = self
+            .entries
+            .get(&key)
+            .ok_or_else(|| PakError::MissingEntry(normalized.clone()))?;
+        let decoded_cache_present = if entry.compressed {
+            self.decoded_entries
+                .get(&key)
+                .ok_or_else(|| {
+                    PakError::Corrupt(format!(
+                        "compressed file cache is missing for {}",
+                        entry.path
+                    ))
+                })?
+                .lock()
+                .map_err(|_| PakError::Corrupt("the decoded-file cache is unavailable".to_owned()))?
+                .is_some()
+        } else {
+            false
+        };
+        Ok(PakEntryDecodeInfo {
+            compressed: entry.compressed,
+            logical_size: entry.size,
+            decoded_cache_present,
+            memory_cache_eligible: entry.compressed
+                && entry.direct_decode_plan.is_none()
+                && entry.size <= self.decode_cache_policy.memory_entry_threshold_bytes
+                && entry.size <= usize::MAX as u64,
+        })
     }
 
     /// Returns the SHA-256 of the logical, decompressed entry bytes. A
@@ -1140,8 +1227,23 @@ impl PakArchive {
     }
 }
 
+/// Performs a complete read-only inspection. Compressed files are decoded and
+/// checked one at a time, then immediately released so inspection cannot retain
+/// the whole archive's expanded contents.
 pub fn inspect_pak(path: impl AsRef<Path>) -> Result<PakInventory> {
-    Ok(PakArchive::open(path)?.into_inventory())
+    inspect_pak_strict(path)
+}
+
+fn inspect_pak_strict(path: impl AsRef<Path>) -> Result<PakInventory> {
+    let cancellation = CancellationToken::new();
+    Ok(PakArchive::open_internal(
+        path.as_ref(),
+        LogicalValidation::StrictDiscard,
+        true,
+        &cancellation,
+        &mut |_| {},
+    )?
+    .into_inventory())
 }
 
 /// Public core-API spelling retained by `lib.rs`.
@@ -1194,7 +1296,7 @@ pub fn write_pak_v11(
             .map_err(|error| PakError::Io(error.into_error()))?;
         output.sync_all()?;
         drop(output);
-        inspect_pak(output_path)
+        inspect_pak_strict(output_path)
     })();
     if result.is_err() {
         // The file was created by this call with `create_new`, so cleanup can
@@ -1552,7 +1654,7 @@ where
             return Err(PakError::MissingEntry(requested_path.clone()));
         }
     }
-    prepare_output_compression(compression)?;
+    prepare_output_compression(compression, Some(cancellation))?;
 
     let output = OpenOptions::new()
         .write(true)
@@ -1671,7 +1773,7 @@ where
         let verification_cache_policy = DecodeCachePolicy::runtime()?;
         PakArchive::open_internal_with_policy(
             output_path,
-            true,
+            LogicalValidation::StrictDiscard,
             multithreaded,
             cancellation,
             &mut |verification| match verification {
@@ -1707,12 +1809,15 @@ where
     result
 }
 
-fn prepare_output_compression(compression: OutputCompression) -> Result<()> {
+fn prepare_output_compression(
+    compression: OutputCompression,
+    cancellation: Option<&CancellationToken>,
+) -> Result<()> {
     if compression == OutputCompression::None {
         return Ok(());
     }
 
-    prepare_oodle_support("merged output")
+    prepare_oodle_support("merged output", cancellation)
 }
 
 /// Returns the exact pure block layout used by the pinned v11 writer for an
@@ -1728,16 +1833,24 @@ pub(crate) fn oodle_output_block_layout(logical_size: u64) -> Result<(u64, u64)>
 /// compress input data or repeatedly load the codec.
 pub(crate) fn oodle_output_block_bounds(
     raw_block_sizes: &BTreeSet<u64>,
+    cancellation: Option<&CancellationToken>,
 ) -> Result<BTreeMap<u64, u64>> {
     if raw_block_sizes.is_empty() {
         return Ok(BTreeMap::new());
     }
-    prepare_output_compression(OutputCompression::Oodle)?;
-    let oodle = oodle_loader::oodle()
-        .map_err(|error| oodle_prepare_error("merged output size estimate", error))?;
+    let oodle = match oodle_loader::oodle_with_cancel(|| {
+        cancellation.is_some_and(CancellationToken::is_cancelled)
+    }) {
+        Ok(oodle) => oodle,
+        Err(oodle_loader::Error::Cancelled) => return Err(PakError::Cancelled),
+        Err(error) => return Err(oodle_prepare_error("merged output size estimate", error)),
+    };
     raw_block_sizes
         .iter()
         .map(|&raw_size| {
+            if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                return Err(PakError::Cancelled);
+            }
             if raw_size == 0 || raw_size > u64::from(u32::MAX) {
                 return Err(PakError::Corrupt(format!(
                     "invalid Oodle output block size {raw_size}"
@@ -1755,23 +1868,14 @@ pub(crate) fn oodle_output_block_bounds(
         .collect()
 }
 
-fn prepare_oodle_support(context: &str) -> Result<()> {
-    #[cfg(windows)]
-    {
-        let runtime_path = std::env::current_exe()
-            .map_err(|error| oodle_prepare_error(context, error))?
-            .with_file_name(OODLE_RUNTIME_FILE_NAME);
-        if runtime_path.exists() {
-            validate_oodle_runtime_hash(&runtime_path)?;
-        }
-        oodle_loader::oodle().map_err(|error| oodle_prepare_error(context, error))?;
-        validate_oodle_runtime_hash(&runtime_path)?;
+fn prepare_oodle_support(context: &str, cancellation: Option<&CancellationToken>) -> Result<()> {
+    match oodle_loader::oodle_with_cancel(|| {
+        cancellation.is_some_and(CancellationToken::is_cancelled)
+    }) {
+        Ok(_) => Ok(()),
+        Err(oodle_loader::Error::Cancelled) => Err(PakError::Cancelled),
+        Err(error) => Err(oodle_prepare_error(context, error)),
     }
-
-    #[cfg(not(windows))]
-    oodle_loader::oodle().map_err(|error| oodle_prepare_error(context, error))?;
-
-    Ok(())
 }
 
 fn oodle_prepare_error(path: &str, error: impl std::fmt::Display) -> PakError {
@@ -1779,31 +1883,6 @@ fn oodle_prepare_error(path: &str, error: impl std::fmt::Display) -> PakError {
         path: path.to_owned(),
         reason: error.to_string(),
     }
-}
-
-#[cfg(windows)]
-fn validate_oodle_runtime_hash(path: &Path) -> Result<()> {
-    let mut file = File::open(path).map_err(|error| {
-        oodle_prepare_error(
-            &path.display().to_string(),
-            format!("the Oodle support file could not be opened: {error}"),
-        )
-    })?;
-    let actual = hash_file_sha256(&mut file).map_err(|error| {
-        oodle_prepare_error(
-            &path.display().to_string(),
-            format!("the Oodle support file could not be checked: {error}"),
-        )
-    })?;
-    if actual != OODLE_RUNTIME_SHA256 {
-        return Err(oodle_prepare_error(
-            &path.display().to_string(),
-            format!(
-                "the existing Oodle support file has SHA-256 {actual}, expected {OODLE_RUNTIME_SHA256}; delete it and try again"
-            ),
-        ));
-    }
-    Ok(())
 }
 
 /// Generic writer entry point used by tests and by callers that manage their
@@ -1890,7 +1969,7 @@ pub fn verify_pak_v11(
     path: impl AsRef<Path>,
     expected: Option<&PakInventory>,
 ) -> Result<PakInventory> {
-    let actual = inspect_pak(path)?;
+    let actual = inspect_pak_strict(path)?;
     if actual.footer.version != SUPPORTED_PAK_VERSION {
         return Err(PakError::UnsupportedVersion {
             actual: actual.footer.version,
@@ -1931,12 +2010,6 @@ pub fn normalize_entry_path(path: &str) -> Result<String> {
     }
     if path.chars().any(|c| c == '\0' || c.is_control()) {
         return Err(invalid_path(path, "NUL/control characters are forbidden"));
-    }
-    if !path.is_ascii() {
-        return Err(invalid_path(
-            path,
-            "non-ASCII paths are outside the v1 case-folding profile",
-        ));
     }
     if path.contains(':') {
         return Err(invalid_path(
@@ -2496,7 +2569,7 @@ fn parse_and_validate_legacy_index(
         }
 
         file.seek(SeekFrom::Start(indexed.stored_offset))?;
-        let mut local_bytes = vec![0u8; header_size as usize];
+        let mut local_bytes = allocate_zeroed_buffer(header_size, "legacy file header")?;
         file.read_exact(&mut local_bytes)?;
         let mut local_cursor = SliceReader::new(&local_bytes, "legacy file header");
         let local = parse_legacy_entry(&mut local_cursor, detected, &path)?;
@@ -3024,7 +3097,7 @@ fn validate_local_entry_header(
     header_size: u64,
 ) -> Result<LegacyEntryMetadata> {
     file.seek(SeekFrom::Start(encoded.header_offset))?;
-    let mut header = vec![0u8; header_size as usize];
+    let mut header = allocate_zeroed_buffer(header_size, "file header")?;
     file.read_exact(&mut header)?;
     let mut cursor = SliceReader::new(&header, "file header");
     let local = parse_legacy_entry(&mut cursor, detected, path)?;
@@ -3212,7 +3285,7 @@ fn read_region_verified(file: &mut File, region: &IndexRegion, limit: u64) -> Re
         )));
     }
     file.seek(SeekFrom::Start(region.offset))?;
-    let mut data = vec![0u8; region.size as usize];
+    let mut data = allocate_zeroed_buffer(region.size, region.name)?;
     file.read_exact(&mut data)?;
     let actual: [u8; 20] = Sha1::digest(&data).into();
     if actual != region.expected_sha1 {
@@ -3223,6 +3296,18 @@ fn read_region_verified(file: &mut File, region: &IndexRegion, limit: u64) -> Re
         });
     }
     Ok(data)
+}
+
+fn allocate_zeroed_buffer(size: u64, context: &str) -> Result<Vec<u8>> {
+    let len = usize::try_from(size).map_err(|_| {
+        PakError::UnsupportedLayout(format!("{context} does not fit this build's address space"))
+    })?;
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(len).map_err(|_| {
+        PakError::UnsupportedLayout(format!("{context} is too large to allocate safely"))
+    })?;
+    bytes.resize(len, 0);
+    Ok(bytes)
 }
 
 fn validate_region(name: &str, offset: u64, size: u64, limit: u64) -> Result<()> {
@@ -3299,23 +3384,6 @@ fn check_cancelled(cancellation: &CancellationToken) -> Result<()> {
     } else {
         Ok(())
     }
-}
-
-fn hash_file_sha256(file: &mut File) -> Result<String> {
-    file.seek(SeekFrom::Start(0))?;
-    let mut reader = BufReader::new(file.try_clone()?);
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0u8; COPY_BUFFER_BYTES];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    let result = hex::encode(hash.finalize());
-    file.seek(SeekFrom::Start(0))?;
-    Ok(result)
 }
 
 struct PayloadHashAccumulator {
@@ -3576,6 +3644,13 @@ fn decode_entry_with_progress(
     } else {
         temporary_builder.tempfile()?
     };
+    {
+        use fs2::FileExt;
+        // Startup cleanup removes only stale decoded files whose ownership
+        // lock can be acquired. Keeping this lock on the NamedTempFile handle
+        // protects an active cache even if another process starts meanwhile.
+        temporary.as_file().lock_exclusive()?;
+    }
     let cache_directory = temporary.path().parent().unwrap_or_else(|| Path::new("."));
     let headroom = (entry.size / 20).max(cache_policy.minimum_disk_headroom_bytes);
     let mut disk_reservation =
@@ -4104,13 +4179,38 @@ mod tests {
             "a\\b.uasset",
             "a/./b.uasset",
             "a/\0b.uasset",
-            "a/한글.uasset",
         ] {
             assert!(normalize_entry_path(path).is_err(), "accepted {path:?}");
         }
         assert_eq!(
             normalize_entry_path("Local/DataBase/EnemyID.uasset").unwrap(),
             "Local/DataBase/EnemyID.uasset"
+        );
+        assert_eq!(
+            normalize_entry_path("데이터/기술 설명.uasset").unwrap(),
+            "데이터/기술 설명.uasset"
+        );
+    }
+
+    #[test]
+    fn unicode_entry_paths_round_trip_through_v11_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("unicode-path.pak");
+        write_pak_v11(
+            &path,
+            "../../../예시/Content/",
+            [PakWriteEntry::new(
+                "데이터/기술 설명.bin",
+                b"unicode path".to_vec(),
+            )],
+        )
+        .unwrap();
+
+        let archive = PakArchive::open(&path).unwrap();
+        assert_eq!(archive.inventory().mount_point, "../../../예시/Content/");
+        assert_eq!(
+            archive.read_entry("데이터/기술 설명.bin").unwrap(),
+            b"unicode path"
         );
     }
 
@@ -4133,6 +4233,14 @@ mod tests {
     fn duplicate_paths_are_rejected_case_insensitively() {
         let result = group_packages(["A/Foo.uasset", "a/foo.UASSET"]);
         assert!(matches!(result, Err(PakError::DuplicatePath { .. })));
+    }
+
+    #[test]
+    fn impossible_index_buffer_allocation_fails_without_panicking() {
+        assert!(matches!(
+            allocate_zeroed_buffer(u64::MAX, "hostile index"),
+            Err(PakError::UnsupportedLayout(_))
+        ));
     }
 
     #[test]
@@ -4317,19 +4425,7 @@ mod tests {
 
     #[test]
     fn uncompressed_output_never_initializes_oodle() {
-        prepare_output_compression(OutputCompression::None).unwrap();
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn existing_oodle_runtime_with_wrong_hash_is_rejected() {
-        let temp = tempfile::tempdir().unwrap();
-        let runtime = temp.path().join(OODLE_RUNTIME_FILE_NAME);
-        std::fs::write(&runtime, b"not an Oodle runtime").unwrap();
-        let error = validate_oodle_runtime_hash(&runtime).unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("SHA-256"));
-        assert!(message.contains("delete it and try again"));
+        prepare_output_compression(OutputCompression::None, None).unwrap();
     }
 
     #[test]
@@ -4711,6 +4807,68 @@ mod tests {
     }
 
     #[test]
+    fn strict_discard_validation_hashes_then_releases_each_compressed_entry() {
+        let payload = (0..700_000u32)
+            .map(|value| (value.wrapping_mul(19) % 251) as u8)
+            .collect::<Vec<_>>();
+        let bytes =
+            synthetic_compressed_pak(repak::Version::V11, repak::Compression::Zstd, &payload);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("strict-discard.pak");
+        std::fs::write(&path, bytes).unwrap();
+        let cancellation = CancellationToken::new();
+
+        let archive = PakArchive::open_internal(
+            &path,
+            LogicalValidation::StrictDiscard,
+            false,
+            &cancellation,
+            &mut |_| {},
+        )
+        .unwrap();
+        assert!(archive.inventory().entries[0].sha256_is_logical);
+        assert_eq!(
+            archive.inventory().entries[0].sha256,
+            hex::encode(Sha256::digest(&payload))
+        );
+        assert_eq!(
+            archive
+                .decode_count
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "verification-only decoding must not populate the merge cache"
+        );
+        assert!(
+            archive
+                .decoded_entries
+                .values()
+                .all(|cache| cache.lock().unwrap().is_none())
+        );
+        let info = archive.entry_decode_info("A/Compressed.bin").unwrap();
+        assert!(info.compressed);
+        assert_eq!(info.logical_size, payload.len() as u64);
+        assert!(!info.decoded_cache_present);
+        assert!(info.memory_cache_eligible);
+    }
+
+    #[test]
+    fn public_inspection_checks_compressed_logical_bytes_without_retaining_them() {
+        let payload = vec![0x45; 700_000];
+        let bytes =
+            synthetic_compressed_pak(repak::Version::V11, repak::Compression::Zstd, &payload);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("structural-inspection.pak");
+        std::fs::write(&path, bytes).unwrap();
+
+        let inventory = inspect_pak(&path).unwrap();
+        assert!(inventory.entries[0].sha256_is_logical);
+        assert_eq!(
+            inventory.entries[0].sha256,
+            hex::encode(Sha256::digest(&payload))
+        );
+    }
+
+    #[test]
     fn small_compressed_entry_can_spill_to_one_reused_temporary_mapping_and_be_released() {
         let payload = (0..900_000u32)
             .map(|value| (value.wrapping_mul(43) % 251) as u8)
@@ -4761,6 +4919,16 @@ mod tests {
         };
         assert!(temporary_path.starts_with(cache_directory.path()));
         assert!(temporary_path.exists());
+        #[cfg(windows)]
+        {
+            use fs2::FileExt;
+            let competing = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&temporary_path)
+                .unwrap();
+            assert!(competing.try_lock_exclusive().is_err());
+        }
         drop(cached);
         drop(mapped);
         assert_eq!(archive.release_decoded_cache(), 1);

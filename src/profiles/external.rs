@@ -121,7 +121,12 @@ pub fn parse_external_profile_json(bytes: &[u8]) -> Result<GameProfile, ProfileL
             .map(ExternalPathMatcher::into_matcher)
             .collect::<Result<Vec<_>, _>>()?,
         minimum_detection_matches: document.detection.minimum_matches,
-        root_scope_matchers: Vec::new(),
+        root_scope_matchers: document
+            .detection
+            .root_scope_matchers
+            .into_iter()
+            .map(ExternalPathMatcher::into_matcher)
+            .collect::<Result<Vec<_>, _>>()?,
         assets: document
             .assets
             .into_iter()
@@ -148,6 +153,8 @@ struct ExternalProfileDocument {
 struct ExternalDetection {
     minimum_matches: usize,
     path_matchers: Vec<ExternalPathMatcher>,
+    #[serde(default)]
+    root_scope_matchers: Vec<ExternalPathMatcher>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -260,6 +267,7 @@ mod tests {
             ProfilePrecision::Declared
         );
         assert_eq!(profile.assets[0].priority, 0);
+        assert_eq!(profile.root_scope_matchers.len(), 1);
 
         let mut registry = ProfileRegistry::empty();
         registry.register(profile).unwrap();
@@ -277,6 +285,21 @@ mod tests {
                 )
                 .selection,
             AssetProfileSelectionKind::Explicit
+        );
+        assert_eq!(
+            registry
+                .resolve_asset("/Database/Skills", Some("example_game"))
+                .selection,
+            AssetProfileSelectionKind::Explicit
+        );
+        assert_eq!(
+            registry
+                .resolve_asset(
+                    "/OtherGame/Content/Database/Skills.uasset",
+                    Some("example_game"),
+                )
+                .selection,
+            AssetProfileSelectionKind::GenericNoMatch
         );
 
         let row_raw = map(&[
@@ -355,7 +378,7 @@ mod tests {
             "/game/**/*.uasset",
             "file:///game/table",
         ] {
-            let json = VALID.replacen("/examplegame/content/database/skills", path, 1);
+            let json = VALID.replacen("/database/skills", path, 1);
             assert!(matches!(
                 parse_external_profile_json(json.as_bytes()),
                 Err(ProfileLoadError::Validation(_))

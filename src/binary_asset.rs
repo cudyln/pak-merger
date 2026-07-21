@@ -618,6 +618,148 @@ impl<'a> NodeRef<'a> {
     }
 }
 
+/// One validated, allocation-bounded lookup view over a database row map.
+///
+/// Construction checks every key once, so duplicate and non-string fields
+/// remain structural errors. Callers that inspect several atomic units can
+/// then reuse the same O(1) field lookup instead of rescanning the row map for
+/// every field in every unit.
+#[derive(Debug)]
+pub struct RowFieldIndex<'a> {
+    row: NodeRef<'a>,
+    ordered: Vec<(&'a str, &'a MsgpackNode)>,
+    by_name: HashMap<&'a str, &'a MsgpackNode>,
+}
+
+impl<'a> RowFieldIndex<'a> {
+    pub fn new(row: NodeRef<'a>) -> Result<Self> {
+        let entries = row
+            .node
+            .as_map()
+            .ok_or(BinaryAssetError::ExpectedMap("database row"))?;
+        let mut ordered = Vec::new();
+        ordered.try_reserve_exact(entries.len()).map_err(|_| {
+            BinaryAssetError::MessagePackAllocationFailed {
+                resource: "map-field views",
+                requested: entries.len(),
+            }
+        })?;
+        let mut by_name = HashMap::new();
+        by_name.try_reserve(entries.len()).map_err(|_| {
+            BinaryAssetError::MessagePackAllocationFailed {
+                resource: "map-field index",
+                requested: entries.len(),
+            }
+        })?;
+        for entry in entries {
+            let name = entry
+                .key
+                .string_value()
+                .ok_or(BinaryAssetError::NonStringMapKey)?;
+            if by_name.insert(name, &entry.value).is_some() {
+                return Err(BinaryAssetError::DuplicateField(name.to_owned()));
+            }
+            ordered.push((name, &entry.value));
+        }
+        #[cfg(test)]
+        TEST_ROW_FIELD_INDEX_BUILDS.with(|count| count.set(count.get() + 1));
+        Ok(Self {
+            row,
+            ordered,
+            by_name,
+        })
+    }
+
+    pub fn fields(&self) -> &[(&'a str, &'a MsgpackNode)] {
+        &self.ordered
+    }
+
+    pub fn len(&self) -> usize {
+        self.ordered.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ordered.is_empty()
+    }
+
+    pub fn get(&self, field: &str) -> Option<&'a MsgpackNode> {
+        self.by_name.get(field).copied()
+    }
+
+    pub fn row_id(&self) -> Result<RowId> {
+        let value = self.get("m_id").ok_or(BinaryAssetError::MissingRowId)?;
+        logical_row_id_value(value)
+    }
+
+    pub fn field_ref(&self, field: &str) -> Result<NodeRef<'a>> {
+        let node = self
+            .get(field)
+            .ok_or_else(|| BinaryAssetError::MissingField(field.to_owned()))?;
+        Ok(NodeRef {
+            node,
+            source: self.row.source,
+        })
+    }
+
+    pub fn atomic_group_value(&self, unit: &AtomicGroup, field: &str) -> Result<NodeRef<'a>> {
+        let node = self.field_ref(field)?;
+        if let Some(index) = unit.array_index {
+            let items = node.node.as_array().ok_or(BinaryAssetError::ExpectedArray(
+                "audited parallel-array field",
+            ))?;
+            let expected = unit
+                .expected_array_len
+                .ok_or(BinaryAssetError::MissingExpectedArrayLength)?;
+            if items.len() != expected {
+                return Err(BinaryAssetError::ParallelArrayLengthMismatch {
+                    field: field.to_owned(),
+                    expected,
+                    actual: items.len(),
+                });
+            }
+            let selected =
+                items
+                    .get(index)
+                    .ok_or_else(|| BinaryAssetError::ArrayIndexOutOfRange {
+                        field: field.to_owned(),
+                        index,
+                        len: items.len(),
+                    })?;
+            Ok(NodeRef {
+                node: selected,
+                source: self.row.source,
+            })
+        } else {
+            Ok(node)
+        }
+    }
+
+    pub fn atomic_group_hashes(&self, unit: &AtomicGroup) -> Result<AtomicUnitHashes> {
+        hash_atomic_values(
+            unit,
+            |field| self.atomic_group_value(unit, field),
+            |field| self.field_ref(field),
+        )
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_ROW_FIELD_INDEX_BUILDS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_test_row_field_index_builds() {
+    TEST_ROW_FIELD_INDEX_BUILDS.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn test_row_field_index_builds() -> usize {
+    TEST_ROW_FIELD_INDEX_BUILDS.with(std::cell::Cell::get)
+}
+
 impl fmt::Debug for NodeRef<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeRef")
@@ -2534,47 +2676,13 @@ pub fn atomic_group_value<'a>(
     unit: &AtomicGroup,
     field: &str,
 ) -> Result<NodeRef<'a>> {
-    let node = row
-        .node
-        .map_get(field)?
-        .ok_or_else(|| BinaryAssetError::MissingField(field.to_owned()))?;
-    if let Some(index) = unit.array_index {
-        let items = node.as_array().ok_or(BinaryAssetError::ExpectedArray(
-            "audited parallel-array field",
-        ))?;
-        let expected = unit
-            .expected_array_len
-            .ok_or(BinaryAssetError::MissingExpectedArrayLength)?;
-        if items.len() != expected {
-            return Err(BinaryAssetError::ParallelArrayLengthMismatch {
-                field: field.to_owned(),
-                expected,
-                actual: items.len(),
-            });
-        }
-        let node = items
-            .get(index)
-            .ok_or_else(|| BinaryAssetError::ArrayIndexOutOfRange {
-                field: field.to_owned(),
-                index,
-                len: items.len(),
-            })?;
-        Ok(NodeRef {
-            node,
-            source: row.source,
-        })
-    } else {
-        Ok(NodeRef {
-            node,
-            source: row.source,
-        })
-    }
+    RowFieldIndex::new(row)?.atomic_group_value(unit, field)
 }
 
 fn hash_atomic_values<'a>(
     unit: &AtomicGroup,
-    parent_row: Option<NodeRef<'a>>,
     mut value_for: impl FnMut(&str) -> Result<NodeRef<'a>>,
+    mut parent_for: impl FnMut(&str) -> Result<NodeRef<'a>>,
 ) -> Result<AtomicUnitHashes> {
     let mut raw_digest = Sha256::new();
     let mut semantic_digest = Sha256::new();
@@ -2603,18 +2711,11 @@ fn hash_atomic_values<'a>(
         raw_digest.update(name);
         semantic_digest.update(name);
         if unit.array_index.is_some() {
-            if let Some(parent_row) = parent_row {
-                let parent = parent_row
-                    .node
-                    .map_get(field)?
-                    .ok_or_else(|| BinaryAssetError::MissingField(field.clone()))?;
-                let parent_raw = parent.raw(parent_row.source);
-                let header_len = parent.header_end - parent.range.start;
-                hash_len(&mut raw_digest, header_len);
-                raw_digest.update(&parent_raw[..header_len]);
-            } else {
-                hash_len(&mut raw_digest, 0);
-            }
+            let parent = parent_for(field)?;
+            let parent_raw = parent.raw();
+            let header_len = parent.node.header_end - parent.node.range.start;
+            hash_len(&mut raw_digest, header_len);
+            raw_digest.update(&parent_raw[..header_len]);
         }
         let raw = node.raw();
         hash_len(&mut raw_digest, raw.len());
@@ -2638,17 +2739,13 @@ pub fn atomic_unit_hashes(row: NodeRef<'_>, fields: &[String]) -> Result<AtomicU
         array_index: None,
         expected_array_len: None,
     };
-    hash_atomic_values(&unit, Some(row), |field| {
-        atomic_group_value(row, &unit, field)
-    })
+    RowFieldIndex::new(row)?.atomic_group_hashes(&unit)
 }
 
 /// Hashes either complete fields or the selected element from each parallel
 /// array, depending on the audited atomic-group selector.
 pub fn atomic_group_hashes(row: NodeRef<'_>, unit: &AtomicGroup) -> Result<AtomicUnitHashes> {
-    hash_atomic_values(unit, Some(row), |field| {
-        atomic_group_value(row, unit, field)
-    })
+    RowFieldIndex::new(row)?.atomic_group_hashes(unit)
 }
 
 pub fn compare_atomic_units(
@@ -2670,17 +2767,16 @@ pub fn splice_map_fields(
     carrier: NodeRef<'_>,
     replacements: &BTreeMap<String, NodeRef<'_>>,
 ) -> Result<Vec<u8>> {
+    let carrier_fields = RowFieldIndex::new(carrier)?;
     let entries = carrier
         .node
         .as_map()
         .ok_or(BinaryAssetError::ExpectedMap("base Pak row"))?;
-    let carrier_fields = carrier.node.map_fields()?;
-    let known: BTreeSet<&str> = carrier_fields.iter().map(|(name, _)| *name).collect();
     for field in replacements.keys() {
         if field == "m_id" {
             return Err(BinaryAssetError::RowSelectionContainsId);
         }
-        if !known.contains(field.as_str()) {
+        if carrier_fields.get(field).is_none() {
             return Err(BinaryAssetError::MissingField(field.clone()));
         }
     }
@@ -2713,20 +2809,19 @@ pub struct AtomicDonorSelection {
 }
 
 fn splice_map_raw_fields(
-    carrier: NodeRef<'_>,
+    carrier_fields: &RowFieldIndex<'_>,
     replacements: &BTreeMap<String, Vec<u8>>,
 ) -> Result<Vec<u8>> {
+    let carrier = carrier_fields.row;
     let entries = carrier
         .node
         .as_map()
         .ok_or(BinaryAssetError::ExpectedMap("base Pak row"))?;
-    let carrier_fields = carrier.node.map_fields()?;
-    let known: BTreeSet<&str> = carrier_fields.iter().map(|(name, _)| *name).collect();
     for field in replacements.keys() {
         if field == "m_id" {
             return Err(BinaryAssetError::RowSelectionContainsId);
         }
-        if !known.contains(field.as_str()) {
+        if carrier_fields.get(field).is_none() {
             return Err(BinaryAssetError::MissingField(field.clone()));
         }
     }
@@ -2835,7 +2930,8 @@ pub fn merge_row_atomic_node_refs(
     inputs: &[Option<NodeRef<'_>>],
     selections: &[AtomicDonorSelection],
 ) -> Result<Vec<u8>> {
-    let carrier_id = logical_row_id(carrier_row.node)?;
+    let carrier_fields = RowFieldIndex::new(carrier_row)?;
+    let carrier_id = carrier_fields.row_id()?;
     enum PendingReplacement {
         Whole(Vec<u8>),
         Indexed {
@@ -2844,16 +2940,27 @@ pub fn merge_row_atomic_node_refs(
         },
     }
     let mut pending: BTreeMap<String, PendingReplacement> = BTreeMap::new();
-
-    for selection in selections {
+    let selected_donors = selections
+        .iter()
+        .map(|selection| selection.donor_input)
+        .collect::<BTreeSet<_>>();
+    let mut donor_fields = BTreeMap::new();
+    for donor_input in selected_donors {
         let donor_row = inputs
-            .get(selection.donor_input)
+            .get(donor_input)
             .ok_or(BinaryAssetError::InvalidDonorIndex {
-                donor: selection.donor_input,
+                donor: donor_input,
                 input_count: inputs.len(),
             })?
             .ok_or(BinaryAssetError::MissingRow(carrier_id))?;
-        let donor_id = logical_row_id(donor_row.node)?;
+        donor_fields.insert(donor_input, RowFieldIndex::new(donor_row)?);
+    }
+
+    for selection in selections {
+        let donor_fields = donor_fields
+            .get(&selection.donor_input)
+            .expect("selected donor field index is available");
+        let donor_id = donor_fields.row_id()?;
         if donor_id != carrier_id {
             return Err(BinaryAssetError::RowIdMismatch {
                 carrier: carrier_id,
@@ -2871,7 +2978,7 @@ pub fn merge_row_atomic_node_refs(
             if field == "m_id" {
                 return Err(BinaryAssetError::RowSelectionContainsId);
             }
-            let donor_value = atomic_group_value(donor_row, &unit, field)?;
+            let donor_value = donor_fields.atomic_group_value(&unit, field)?;
             if let Some(index) = selection.array_index {
                 let expected_len = selection
                     .expected_array_len
@@ -2923,24 +3030,13 @@ pub fn merge_row_atomic_node_refs(
                 expected_len,
                 elements,
             } => {
-                let carrier_value = carrier_row
-                    .node
-                    .map_get(&field)?
-                    .ok_or_else(|| BinaryAssetError::MissingField(field.clone()))?;
-                splice_array_element_bytes(
-                    &field,
-                    NodeRef {
-                        node: carrier_value,
-                        source: carrier_row.source,
-                    },
-                    expected_len,
-                    &elements,
-                )?
+                let carrier_value = carrier_fields.field_ref(&field)?;
+                splice_array_element_bytes(&field, carrier_value, expected_len, &elements)?
             }
         };
         replacements.insert(field, bytes);
     }
-    splice_map_raw_fields(carrier_row, &replacements)
+    splice_map_raw_fields(&carrier_fields, &replacements)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3728,6 +3824,20 @@ mod tests {
     }
 
     #[test]
+    fn row_field_index_rejects_duplicate_fields_before_lookup_reuse() {
+        let row_bytes = [0x82, 0xa1, b'x', 1, 0xa1, b'x', 2];
+        let row = parse_messagepack(&row_bytes).unwrap();
+
+        let error = RowFieldIndex::new(NodeRef {
+            node: &row,
+            source: &row_bytes,
+        })
+        .unwrap_err();
+
+        assert_eq!(error, BinaryAssetError::DuplicateField("x".to_owned()));
+    }
+
+    #[test]
     fn indexed_selection_requires_an_analyzed_array_length() {
         let carrier_bytes = asset(&[row(1, &[0x91, 1], &[2])], 0x90);
         let donor_bytes = asset(&[row(1, &[0x91, 3], &[2])], 0x90);
@@ -3811,6 +3921,7 @@ mod tests {
         let carrier = BinaryAsset::parse(&carrier_bytes).unwrap();
         let donor_a = BinaryAsset::parse(&donor_a_bytes).unwrap();
         let donor_b = BinaryAsset::parse(&donor_b_bytes).unwrap();
+        reset_test_row_field_index_builds();
         let merged_row = merge_row_atomic_units(
             &[&carrier, &donor_a, &donor_b],
             0,
@@ -3831,6 +3942,7 @@ mod tests {
             ],
         )
         .unwrap();
+        assert_eq!(test_row_field_index_builds(), 3);
         let merged = parse_messagepack(&merged_row).unwrap();
         let x = merged.map_get("x").unwrap().unwrap();
         let y = merged.map_get("y").unwrap().unwrap();
@@ -4054,6 +4166,144 @@ mod tests {
             let mut bytes = vec![marker];
             bytes.resize(1 + supplied, 0);
             prop_assert!(parse_messagepack(&bytes).is_err());
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig {
+            cases: 48,
+            max_shrink_iters: 256,
+            failure_persistence: None,
+            rng_seed: proptest::test_runner::RngSeed::Fixed(0x4D50_0103),
+            .. ProptestConfig::default()
+        })]
+
+        /// Valid generated databases must produce the same row order, IDs,
+        /// and exact row ranges in the allocating and compact parsers.
+        #[test]
+        fn compact_and_allocating_parsers_agree_on_generated_databases(
+            values in prop::collection::vec((any::<i8>(), any::<i8>()), 0..40)
+        ) {
+            let rows = values
+                .iter()
+                .enumerate()
+                .map(|(index, (x, y))| {
+                    row(
+                        (index + 1) as u8,
+                        &[0xd0, *x as u8],
+                        &[0xd0, *y as u8],
+                    )
+                })
+                .collect::<Vec<_>>();
+            let marker = if rows.len() <= 15 { 0x90 } else { 0xdc };
+            let bytes = asset(&rows, marker);
+            let allocating = BinaryAsset::parse(&bytes).unwrap();
+            let compact = IndexedBinaryAsset::parse_backed(bytes).unwrap();
+
+            prop_assert_eq!(allocating.row_ids(), compact.row_ids());
+            prop_assert_eq!(allocating.row_count(), compact.row_count());
+            for index in 0..allocating.row_count() {
+                let allocating_row = allocating.row_at(index).unwrap().unwrap();
+                let compact_row = compact.row_at(index).unwrap().unwrap();
+                prop_assert_eq!(allocating_row.id, compact_row.id);
+                prop_assert_eq!(allocating_row.node_ref().raw(), compact_row.node_ref().raw());
+            }
+        }
+
+        /// Random raw replacements preserve every unselected map field and
+        /// every unselected array element byte-for-byte.
+        #[test]
+        fn raw_splices_change_only_selected_values(
+            x in any::<i8>(),
+            y in any::<i8>(),
+            replacement in any::<i8>(),
+            replace_x in any::<bool>(),
+            array_values in prop::collection::vec(any::<i8>(), 1..32),
+            selected_seed in any::<usize>(),
+        ) {
+            let carrier_bytes = row(1, &[0xd0, x as u8], &[0xd0, y as u8]);
+            let carrier_node = parse_messagepack(&carrier_bytes).unwrap();
+            let carrier_ref = NodeRef { node: &carrier_node, source: &carrier_bytes };
+            let carrier_fields = RowFieldIndex::new(carrier_ref).unwrap();
+            let selected_field = if replace_x { "x" } else { "y" };
+            let mut field_replacements = BTreeMap::new();
+            field_replacements.insert(selected_field.to_owned(), vec![0xd0, replacement as u8]);
+            let merged_row = splice_map_raw_fields(&carrier_fields, &field_replacements).unwrap();
+            let merged_node = parse_messagepack(&merged_row).unwrap();
+            let merged_fields = merged_node.map_fields().unwrap();
+            prop_assert_eq!(
+                merged_fields.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
+                vec!["m_id", "x", "y"]
+            );
+            for (name, node) in merged_fields {
+                let expected = if name == selected_field {
+                    &[0xd0, replacement as u8][..]
+                } else {
+                    carrier_node.map_get(name).unwrap().unwrap().raw(&carrier_bytes)
+                };
+                prop_assert_eq!(node.raw(&merged_row), expected);
+            }
+
+            let mut array_bytes = encode_array_header_like(0x90, array_values.len()).unwrap();
+            for value in &array_values {
+                array_bytes.extend_from_slice(&[0xd0, *value as u8]);
+            }
+            let array_node = parse_messagepack(&array_bytes).unwrap();
+            let selected = selected_seed % array_values.len();
+            let replacement_bytes = vec![0xd0, replacement as u8];
+            let mut element_replacements = BTreeMap::new();
+            element_replacements.insert(selected, replacement_bytes.clone());
+            let merged_array = splice_array_element_bytes(
+                "values",
+                NodeRef { node: &array_node, source: &array_bytes },
+                array_values.len(),
+                &element_replacements,
+            )
+            .unwrap();
+            let merged_array_node = parse_messagepack(&merged_array).unwrap();
+            let original_items = array_node.as_array().unwrap();
+            let merged_items = merged_array_node.as_array().unwrap();
+            prop_assert_eq!(original_items.len(), merged_items.len());
+            for (index, (original, merged)) in
+                original_items.iter().zip(merged_items.iter()).enumerate()
+            {
+                let expected = if index == selected {
+                    replacement_bytes.as_slice()
+                } else {
+                    original.raw(&array_bytes)
+                };
+                prop_assert_eq!(merged.raw(&merged_array), expected);
+            }
+        }
+    }
+
+    /// Array headers retain their family where possible and promote at
+    /// the exact fixarray/array16 boundaries. Both walkers must consume
+    /// the complete generated value, including array32 promotion.
+    #[test]
+    fn encoded_array_headers_round_trip_across_family_boundaries() {
+        for marker in [0x90_u8, 0xdc, 0xdd] {
+            for len in [0_usize, 1, 15, 16, 17, 65_535, 65_536] {
+                let mut bytes = encode_array_header_like(marker, len).unwrap();
+                bytes.extend(std::iter::repeat_n(0xc0, len));
+                let parsed = parse_messagepack(&bytes).unwrap();
+                assert_eq!(parsed.as_array().unwrap().len(), len);
+
+                let mut budget = ParseBudget::new(indexed_scan_limits(bytes.len()), None);
+                assert_eq!(
+                    scan_node_end(&bytes, 0, 0, &mut budget).unwrap(),
+                    bytes.len()
+                );
+
+                let expected_marker = if marker & 0xf0 == 0x90 && len <= 15 {
+                    0x90 | len as u8
+                } else if marker != 0xdd && len <= usize::from(u16::MAX) {
+                    0xdc
+                } else {
+                    0xdd
+                };
+                assert_eq!(bytes[0], expected_marker);
+            }
         }
     }
 }

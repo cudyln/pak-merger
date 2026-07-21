@@ -1998,6 +1998,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 name = "oodle_loader"
 version = "0.2.3"
 dependencies = [
+ "fs2",
  "hex",
  "libloading 0.9.0",
  "sha2",
@@ -2036,7 +2037,7 @@ dependencies = [
 
 [[package]]
 name = "pak-merger"
-version = "1.0.0-r1"
+version = "1.0.1"
 dependencies = [
  "anyhow",
  "clap",
