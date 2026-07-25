@@ -3492,10 +3492,19 @@ pub fn run() -> anyhow::Result<()> {
     .map_err(|error| anyhow::anyhow!(error.to_string()))
 }
 
+const KOREAN_FONT_CANDIDATES: &[&str] = &["malgun.ttf", "malgunsl.ttf"];
+const JAPANESE_FONT_CANDIDATES: &[&str] = &["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"];
+
+/// One group per script. The UI loads the best available font from every group,
+/// not just the active locale's, so text in another script still renders — the
+/// language menu names each language in its own script, and file paths can hold
+/// any of them.
+const CJK_FONT_GROUPS: &[&[&str]] = &[KOREAN_FONT_CANDIDATES, JAPANESE_FONT_CANDIDATES];
+
 fn locale_font_candidates(locale: UiLocale) -> &'static [&'static str] {
     match locale {
-        UiLocale::Korean => &["malgun.ttf", "malgunsl.ttf"],
-        UiLocale::Japanese => &["YuGothM.ttc", "meiryo.ttc", "msgothic.ttc"],
+        UiLocale::Korean => KOREAN_FONT_CANDIDATES,
+        UiLocale::Japanese => JAPANESE_FONT_CANDIDATES,
         UiLocale::English => &[],
     }
 }
@@ -3525,47 +3534,72 @@ fn locale_font_available(locale: UiLocale) -> bool {
 
 fn configure_locale_fonts(context: &egui::Context, locale: UiLocale) -> bool {
     let mut fonts = egui::FontDefinitions::default();
-    if matches!(locale, UiLocale::English) {
-        context.set_fonts(fonts);
-        return true;
-    }
+    let primary = locale_font_candidates(locale);
     #[cfg(windows)]
     {
         const MAX_SYSTEM_FONT_BYTES: u64 = 64 * 1024 * 1024;
         let Some(windows_root) = std::env::var_os("WINDIR") else {
+            // English reads fine with the built-in font; the CJK locales cannot.
+            if primary.is_empty() {
+                context.set_fonts(fonts);
+                return true;
+            }
             return false;
         };
         let fonts_root = PathBuf::from(windows_root).join("Fonts");
-        for file_name in locale_font_candidates(locale) {
-            let path = fonts_root.join(file_name);
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_SYSTEM_FONT_BYTES
-            {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
-            let name = format!("windows-locale-{file_name}");
-            fonts
-                .font_data
-                .insert(name.clone(), egui::FontData::from_owned(bytes).into());
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+
+        let load_first_available = |group: &[&str], fonts: &mut egui::FontDefinitions| {
+            group.iter().find_map(|file_name| {
+                let path = fonts_root.join(file_name);
+                let metadata = std::fs::metadata(&path).ok()?;
+                if !metadata.is_file()
+                    || metadata.len() == 0
+                    || metadata.len() > MAX_SYSTEM_FONT_BYTES
+                {
+                    return None;
+                }
+                let bytes = std::fs::read(path).ok()?;
+                let name = format!("windows-locale-{file_name}");
                 fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .insert(0, name.clone());
-            }
-            context.set_fonts(fonts);
-            return true;
+                    .font_data
+                    .insert(name.clone(), egui::FontData::from_owned(bytes).into());
+                Some(name)
+            })
+        };
+
+        // The active locale's font goes first so its glyphs win, then one font
+        // from every other script as a fallback.
+        let mut ordered_names = Vec::new();
+        if !primary.is_empty() {
+            let Some(name) = load_first_available(primary, &mut fonts) else {
+                return false;
+            };
+            ordered_names.push(name);
         }
-        false
+        for group in CJK_FONT_GROUPS {
+            if std::ptr::eq(*group, primary) {
+                continue;
+            }
+            if let Some(name) = load_first_available(group, &mut fonts) {
+                ordered_names.push(name);
+            }
+        }
+
+        for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+            let entry = fonts.families.entry(family).or_default();
+            for (rank, name) in ordered_names.iter().enumerate() {
+                entry.insert(rank, name.clone());
+            }
+        }
+        context.set_fonts(fonts);
+        true
     }
     #[cfg(not(windows))]
     {
+        if primary.is_empty() {
+            context.set_fonts(fonts);
+            return true;
+        }
         let _ = context;
         false
     }
