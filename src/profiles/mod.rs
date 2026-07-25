@@ -3,6 +3,7 @@
 mod external;
 mod generic;
 mod octopath_traveler_0;
+mod octopath_traveler_2;
 
 pub use external::{
     EXTERNAL_PROFILE_SCHEMA_VERSION, MAX_EXTERNAL_PROFILE_BYTES, ProfileLoadError,
@@ -51,14 +52,141 @@ pub enum ProfileFormat {
     /// A BinaryAsset MessagePack payload with `m_DataList` rows keyed by `m_id`.
     #[serde(rename = "messagepack_m_data_list_v1")]
     MessagePackMDataListV1,
+    /// A cooked UE4 `UDataTable` export whose rows are keyed by `FName`.
+    #[serde(rename = "ue4_datatable_v1")]
+    Ue4DataTableV1,
 }
 
 impl ProfileFormat {
     pub const fn id(self) -> &'static str {
         match self {
             Self::MessagePackMDataListV1 => "messagepack_m_data_list_v1",
+            Self::Ue4DataTableV1 => "ue4_datatable_v1",
         }
     }
+
+    /// Row identity this format uses, which decides how a plan's `row_id`
+    /// string is parsed back into a key.
+    pub const fn row_identity(self) -> RowIdentity {
+        match self {
+            Self::MessagePackMDataListV1 => RowIdentity::Integer,
+            Self::Ue4DataTableV1 => RowIdentity::Name,
+        }
+    }
+
+    /// Cooked-package layout this format's databases are stored in.
+    ///
+    /// This is the dispatch point that keeps package assumptions out of the
+    /// merge pipeline. Adding a format without extending this match is a
+    /// compile error, which is the intended safety property: a database must
+    /// never reach another format's reader by default.
+    pub const fn package_shell(self) -> PackageShellSpec {
+        match self {
+            Self::MessagePackMDataListV1 => PackageShellSpec::OT0_UE5_BINARY_ASSET,
+            Self::Ue4DataTableV1 => PackageShellSpec::OT2_UE4_DATA_TABLE,
+        }
+    }
+}
+
+/// How a database format identifies a row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowIdentity {
+    /// An integer key, such as OT0's `m_id`.
+    Integer,
+    /// An `FName` string key, such as a `UDataTable` row name.
+    Name,
+}
+
+/// Where a cooked package records the identity of its single export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackagePathSource {
+    /// The summary FolderName carries the real package path, and the export
+    /// object name must equal its last segment. This is how OT0 cooks.
+    FolderName { required_prefix: &'static str },
+    /// FolderName carries no path (UE4 stores the literal `None`), so identity
+    /// comes from the export object name alone.
+    ExportObjectName,
+}
+
+/// Byte layout of one cooked-package family, so the shell reader carries no
+/// game-specific constants of its own.
+///
+/// Summary field offsets are relative to the end of the FolderName FString,
+/// matching the shell reader's `field_offset` convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PackageShellSpec {
+    pub legacy_version: i32,
+    /// Length of the zero run after LegacyFileVersion that proves the package
+    /// is unversioned. UE5 adds FileVersionUE5, so its run is 4 bytes longer.
+    pub version_zero_run_len: usize,
+    pub total_header_size_offset: usize,
+    pub folder_name_offset: usize,
+    /// Checked as `flags & mask == value`; an exact match uses an all-ones mask.
+    pub package_flags_mask: u32,
+    pub package_flags_value: u32,
+    pub import_entry_size: usize,
+    pub export_count_field: usize,
+    pub export_offset_field: usize,
+    pub import_count_field: usize,
+    pub import_offset_field: usize,
+    pub bulk_data_start_offset_field: usize,
+    pub expected_export_class: &'static str,
+    pub package_path_source: PackagePathSource,
+}
+
+impl PackageShellSpec {
+    /// OCTOPATH TRAVELER 0: UE5 legacy `-8` with one `BinaryAsset` export.
+    /// Its cooked imports carry a 4-byte package-name extension after the
+    /// traditional 28-byte `FObjectImport` body, hence the 32-byte stride.
+    pub const OT0_UE5_BINARY_ASSET: Self = Self {
+        legacy_version: -8,
+        version_zero_run_len: 20,
+        total_header_size_offset: 0x1C,
+        folder_name_offset: 0x20,
+        package_flags_mask: u32::MAX,
+        package_flags_value: 0x8000_2200,
+        import_entry_size: 32,
+        export_count_field: 0x1C,
+        export_offset_field: 0x20,
+        import_count_field: 0x24,
+        import_offset_field: 0x28,
+        bulk_data_start_offset_field: 0x8C,
+        expected_export_class: "BinaryAsset",
+        package_path_source: PackagePathSource::FolderName {
+            required_prefix: "/Game/",
+        },
+    };
+
+    /// OCTOPATH TRAVELER II: UE4 legacy `-7` with one `DataTable` export.
+    ///
+    /// UE4 has no SoftObjectPaths pair in its summary, so every field after
+    /// NameOffset sits 8 bytes earlier than UE5, and it omits FileVersionUE5,
+    /// so the unversioned zero run is 4 bytes shorter.
+    ///
+    /// PackageFlags is a required-bits check rather than an exact match:
+    /// measured across the shipped tables, 190 carry `0x80000000` and 11 carry
+    /// `0x80040000` (`PKG_RequiresLocalizationGather`) — the GameText locales,
+    /// `ItemIconText` and `DebugMenuDataList`. An exact comparison would reject
+    /// every localisation table.
+    pub const OT2_UE4_DATA_TABLE: Self = Self {
+        legacy_version: -7,
+        version_zero_run_len: 16,
+        total_header_size_offset: 0x18,
+        folder_name_offset: 0x1C,
+        package_flags_mask: 0x8000_0000,
+        package_flags_value: 0x8000_0000,
+        import_entry_size: 28,
+        export_count_field: 0x14,
+        export_offset_field: 0x18,
+        import_count_field: 0x1C,
+        import_offset_field: 0x20,
+        // UE4's BulkDataStartOffset sits after variable-length summary tails,
+        // so it is not addressable from the FolderName end. The shell reader
+        // only probes it; the UE4 package reader locates it by walking.
+        bulk_data_start_offset_field: 0x24,
+        expected_export_class: "DataTable",
+        package_path_source: PackagePathSource::ExportObjectName,
+    };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -177,6 +305,20 @@ pub struct GameProfile {
     /// paths whose common `Content` root was removed do not require a match.
     pub root_scope_matchers: Vec<PathMatcher>,
     pub assets: Vec<AssetProfileRule>,
+}
+
+impl GameProfile {
+    /// Root prefixes, without the leading `/`, that a Pak entry may carry for
+    /// this game. Derived from the declared root scope so no game name is
+    /// hardcoded outside the profile.
+    pub fn mount_root_prefixes(&self) -> Vec<String> {
+        self.root_scope_matchers
+            .iter()
+            .filter(|matcher| matcher.kind == PathMatchKind::Prefix)
+            .filter_map(|matcher| matcher.value.strip_prefix('/'))
+            .map(str::to_owned)
+            .collect()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -486,6 +628,9 @@ impl ProfileRegistry {
             .register(octopath_traveler_0::game_profile())
             .expect("built-in OT0 profile must be valid");
         registry
+            .register(octopath_traveler_2::game_profile())
+            .expect("built-in OT2 profile must be valid");
+        registry
     }
 
     pub fn register(
@@ -505,6 +650,24 @@ impl ProfileRegistry {
 
     pub fn profiles(&self) -> &[GameProfile] {
         &self.games
+    }
+
+    pub fn game(&self, id: &str) -> Option<&GameProfile> {
+        self.games.iter().find(|game| game.id == id)
+    }
+
+    /// Root prefixes across every registered profile. Used when no profile is
+    /// pinned, so a rooted Pak path can still be compared with an internal
+    /// package path; an unmatched root simply leaves the path unchanged.
+    pub fn all_mount_root_prefixes(&self) -> Vec<String> {
+        let mut roots: Vec<String> = self
+            .games
+            .iter()
+            .flat_map(GameProfile::mount_root_prefixes)
+            .collect();
+        roots.sort();
+        roots.dedup();
+        roots
     }
 
     pub fn summaries(&self) -> Vec<ProfileSummary> {
@@ -1281,6 +1444,44 @@ mod tests {
         assert_eq!(resolved.selection, AssetProfileSelectionKind::Explicit);
         assert_eq!(resolved.profile.id, "skills");
         assert_eq!(resolved.profile.precision, ProfilePrecision::Declared);
+    }
+
+    #[test]
+    fn every_format_supplies_a_package_shell_and_ot0_keeps_its_ue5_layout() {
+        // The shell spec is the dispatch point that keeps package assumptions
+        // out of merge.rs. A new ProfileFormat variant must extend the match in
+        // ProfileFormat::package_shell, and must not silently reuse OT0's.
+        let ot0 = ProfileFormat::MessagePackMDataListV1.package_shell();
+        assert_eq!(ot0, PackageShellSpec::OT0_UE5_BINARY_ASSET);
+        assert_eq!(ot0.legacy_version, -8);
+        assert_eq!(ot0.version_zero_run_len, 20);
+        assert_eq!(ot0.import_entry_size, 32);
+        assert_eq!(ot0.expected_export_class, "BinaryAsset");
+        // OT0's flags are still matched exactly, not by required bits.
+        assert_eq!(ot0.package_flags_mask, u32::MAX);
+        assert_eq!(ot0.package_flags_value, 0x8000_2200);
+        assert_eq!(
+            ot0.package_path_source,
+            PackagePathSource::FolderName {
+                required_prefix: "/Game/"
+            }
+        );
+    }
+
+    #[test]
+    fn mount_root_prefixes_come_from_the_declared_root_scope() {
+        let registry = ProfileRegistry::with_builtins();
+        let ot0 = registry.game("octopath_traveler_0").expect("built-in OT0");
+        assert_eq!(
+            ot0.mount_root_prefixes(),
+            ["octopath_traveler0/content/".to_owned()]
+        );
+        assert!(
+            registry
+                .all_mount_root_prefixes()
+                .contains(&"octopath_traveler0/content/".to_owned())
+        );
+        assert!(registry.game("not_registered").is_none());
     }
 
     #[test]

@@ -6,18 +6,26 @@ Game profiles tell Pak Merger which database fields must be selected together. T
 
 Built-in profiles are selected automatically when there is one clear match. If no profile matches, or more than one profile matches equally, Pak Merger uses its general comparison rules.
 
+Two built-in profiles ship: OCTOPATH TRAVELER 0 (`octopath_traveler_0`) and OCTOPATH TRAVELER II (`octopath_traveler_2`).
+
 External JSON profiles can currently be loaded through the Rust library API. A profile picker is not yet available in the GUI or CLI.
 
-## Supported Format
+## Supported Formats
 
-Schema version 1 supports `messagepack_m_data_list_v1`: a MessagePack database with rows stored in `m_DataList` and identified by `m_id`.
+Schema version 1 supports:
+
+- `messagepack_m_data_list_v1`: a MessagePack database with rows stored in `m_DataList` and identified by `m_id`.
+- `ue4_datatable_v1`: a cooked Unreal Engine 4 `UDataTable` export whose rows are identified by name.
+
+A profile's format also selects the cooked package layout Pak Merger expects, so
+the two cannot be mixed within one profile.
 
 A profile contains:
 
 - `schemaVersion`: Must be `1`.
 - `id`: Unique profile identifier.
 - `displayName`: Name shown to users.
-- `format`: Currently `messagepack_m_data_list_v1`.
+- `format`: `messagepack_m_data_list_v1` or `ue4_datatable_v1`.
 - `detection`: Pak path rules used to identify the game or data layout.
 - `assets`: Rules for matching database files and grouping related fields.
 

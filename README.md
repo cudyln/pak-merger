@@ -14,7 +14,7 @@ The Windows GUI and CLI are included in a single `pak-merger.exe`. UnrealPak is 
 - If two Paks change the same field differently, you choose which value to keep.
 - If a file cannot be compared safely, you choose one Pak for the complete related file group.
 
-Field-level database merging is currently tuned for OCTOPATH TRAVELER 0. Other readable Unreal Paks can still be combined, but unfamiliar game data may require a whole-file choice.
+Field-level database merging currently applies to OCTOPATH TRAVELER 0 and OCTOPATH TRAVELER II. Other readable Unreal Paks can still be combined, but unfamiliar game data may require a whole-file choice.
 
 ## Supported Files
 

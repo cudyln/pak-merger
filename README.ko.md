@@ -14,7 +14,7 @@ Windows GUI와 CLI가 하나의 `pak-merger.exe`에 들어 있습니다. UnrealP
 - 두 Pak이 같은 필드를 서로 다르게 바꾼 경우 어느 쪽 값을 남길지 직접 선택합니다.
 - 안전하게 비교할 수 없는 파일은 관련 파일 묶음 전체를 어느 Pak에서 가져올지 선택합니다.
 
-데이터베이스 필드 병합은 현재 OCTOPATH TRAVELER 0에 맞춰져 있습니다. 다른 Unreal Pak도 읽을 수 있으면 합칠 수 있지만, 구조를 알 수 없는 데이터는 파일 전체를 선택해야 할 수 있습니다.
+데이터베이스 필드 병합은 현재 OCTOPATH TRAVELER 0과 OCTOPATH TRAVELER II에 적용됩니다. 다른 Unreal Pak도 읽을 수 있으면 합칠 수 있지만, 구조를 알 수 없는 데이터는 파일 전체를 선택해야 할 수 있습니다.
 
 ## 지원 파일
 

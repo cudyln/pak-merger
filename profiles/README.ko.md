@@ -6,18 +6,25 @@
 
 내장 프로필은 확실하게 일치하는 항목이 하나일 때 자동으로 적용됩니다. 일치하는 프로필이 없거나 여러 개가 같은 조건으로 맞으면 범용 비교 방식을 사용합니다.
 
+내장 프로필은 두 개입니다. OCTOPATH TRAVELER 0(`octopath_traveler_0`)과 OCTOPATH TRAVELER II(`octopath_traveler_2`)입니다.
+
 외부 JSON 프로필은 현재 Rust 라이브러리 API로 불러올 수 있습니다. GUI와 CLI에는 프로필 선택 기능이 아직 없습니다.
 
 ## 지원 형식
 
-스키마 버전 1은 `messagepack_m_data_list_v1`을 지원합니다. 행이 `m_DataList`에 저장되고 `m_id`로 구분되는 MessagePack 데이터베이스 형식입니다.
+스키마 버전 1은 다음 두 형식을 지원합니다.
+
+- `messagepack_m_data_list_v1`: 행이 `m_DataList`에 저장되고 `m_id`로 구분되는 MessagePack 데이터베이스.
+- `ue4_datatable_v1`: 행을 이름으로 구분하는 쿡된 언리얼 엔진 4 `UDataTable`.
+
+형식은 Pak Merger가 기대하는 쿡된 패키지 구조도 함께 결정하므로, 한 프로필 안에서 두 형식을 섞을 수 없습니다.
 
 프로필은 다음 항목으로 구성됩니다.
 
 - `schemaVersion`: 반드시 `1`이어야 합니다.
 - `id`: 프로필 고유 식별자입니다.
 - `displayName`: 사용자에게 표시할 이름입니다.
-- `format`: 현재는 `messagepack_m_data_list_v1`입니다.
+- `format`: `messagepack_m_data_list_v1` 또는 `ue4_datatable_v1`입니다.
 - `detection`: 게임이나 데이터 구성을 판별할 Pak 내부 경로 조건입니다.
 - `assets`: 데이터베이스 파일을 찾고 관련 필드를 묶는 규칙입니다.
 

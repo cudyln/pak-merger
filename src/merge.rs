@@ -5,8 +5,9 @@ use crate::binary_asset::{
     RowFieldIndex, RowId,
 };
 use crate::control::CancellationToken;
+use crate::data_table_merge;
 use crate::pak::{self, PackageComponent, PakArchive};
-use crate::profiles;
+use crate::profiles::{self, PackagePathSource, PackageShellSpec};
 use crate::resources;
 use crate::types::*;
 use sha2::{Digest, Sha256};
@@ -404,6 +405,7 @@ pub struct MergeAnalysisSession {
     /// Analysis-owned compact indexes. `IndexedBinaryAsset` keeps the original
     /// archive slice or decoded cache mapping alive without copying the entry.
     parsed_databases: BTreeMap<String, Vec<ParsedDbProvider>>,
+    parsed_data_tables: BTreeMap<String, Vec<DataTableProvider>>,
     cached_database_bytes: u64,
 }
 
@@ -463,6 +465,7 @@ struct AnalysisUnitOutput {
     conflicts: Vec<Conflict>,
     warnings: Vec<String>,
     parsed_database: Option<(String, Vec<ParsedDbProvider>, u64)>,
+    parsed_data_table: Option<(String, Vec<DataTableProvider>, u64)>,
 }
 
 struct ParsedDbProvider {
@@ -565,7 +568,7 @@ pub fn analyze_session_with_registry(
 ) -> Result<MergeAnalysisSession> {
     validate_request(&request)?;
     let opened = open_paks(&request)?;
-    let (plan, parsed_databases, cached_database_bytes) = analyze_opened(
+    let (plan, parsed_databases, parsed_data_tables, cached_database_bytes) = analyze_opened(
         request,
         &opened,
         &profile_registry,
@@ -578,6 +581,7 @@ pub fn analyze_session_with_registry(
         opened,
         profile_registry,
         parsed_databases,
+        parsed_data_tables,
         cached_database_bytes,
     })
 }
@@ -630,7 +634,7 @@ where
     check_cancel(Some(cancelled))?;
     validate_cached_request(&request, &archives)?;
     let opened = opened_from_archives(&request, archives)?;
-    let (plan, parsed_databases, cached_database_bytes) = analyze_opened(
+    let (plan, parsed_databases, parsed_data_tables, cached_database_bytes) = analyze_opened(
         request,
         &opened,
         &profile_registry,
@@ -643,9 +647,19 @@ where
         opened,
         profile_registry,
         parsed_databases,
+        parsed_data_tables,
         cached_database_bytes,
     })
 }
+
+/// Plan plus the analysis-owned indexes the write step reuses, one map per
+/// database format.
+type AnalyzedInputs = (
+    MergePlan,
+    BTreeMap<String, Vec<ParsedDbProvider>>,
+    BTreeMap<String, Vec<DataTableProvider>>,
+    u64,
+);
 
 fn analyze_opened(
     request: AnalysisRequest,
@@ -654,7 +668,7 @@ fn analyze_opened(
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
     progress: &mut dyn FnMut(usize, usize, Option<String>),
-) -> Result<(MergePlan, BTreeMap<String, Vec<ParsedDbProvider>>, u64)> {
+) -> Result<AnalyzedInputs> {
     let carrier_index = opened
         .iter()
         .position(|input| same_path(&input.descriptor.path, &request.carrier_path))
@@ -670,6 +684,7 @@ fn analyze_opened(
     let mut assets = Vec::new();
     let mut conflicts = Vec::new();
     let mut parsed_databases = BTreeMap::new();
+    let mut parsed_data_tables = BTreeMap::new();
     let mut cached_database_bytes = 0_u64;
     let mut warnings = opened
         .iter()
@@ -735,6 +750,12 @@ fn analyze_opened(
                 .ok_or(MergeError::SizeOverflow("database cache"))?;
             parsed_databases.insert(key, providers);
         }
+        if let Some((key, providers, disk_bytes)) = output.parsed_data_table.take() {
+            cached_database_bytes = cached_database_bytes
+                .checked_add(disk_bytes)
+                .ok_or(MergeError::SizeOverflow("database cache"))?;
+            parsed_data_tables.insert(key, providers);
+        }
         assets.push(output.asset);
         conflicts.append(&mut output.conflicts);
         ensure_conflict_count(&conflicts)?;
@@ -775,7 +796,12 @@ fn analyze_opened(
         encoding_drift_count,
         full_reencode_forbidden: true,
     };
-    Ok((plan, parsed_databases, cached_database_bytes))
+    Ok((
+        plan,
+        parsed_databases,
+        parsed_data_tables,
+        cached_database_bytes,
+    ))
 }
 
 pub fn resolve(plan: MergePlan, mut resolutions: ResolutionSet) -> Result<ResolvedPlan> {
@@ -872,7 +898,7 @@ where
         total: 1,
         current_item: None,
     });
-    let (current_plan, parsed_databases, _) = analyze_opened(
+    let (current_plan, parsed_databases, parsed_data_tables, _) = analyze_opened(
         resolved.plan.request.clone(),
         &opened,
         profiles::default_registry(),
@@ -898,6 +924,7 @@ where
         &resolutions,
         &opened,
         &parsed_databases,
+        &parsed_data_tables,
         profiles::default_registry(),
         output_path,
         options,
@@ -955,6 +982,7 @@ where
         &resolutions,
         &session.opened,
         &session.parsed_databases,
+        &session.parsed_data_tables,
         &session.profile_registry,
         output_path,
         options,
@@ -970,6 +998,7 @@ fn write_opened_with_progress<F>(
     resolutions: &ResolutionSet,
     opened: &[OpenedPak],
     parsed_databases: &BTreeMap<String, Vec<ParsedDbProvider>>,
+    parsed_data_tables: &BTreeMap<String, Vec<DataTableProvider>>,
     profile_registry: &profiles::ProfileRegistry,
     output_path: &Path,
     options: WriteOptions,
@@ -1024,6 +1053,36 @@ where
                     append_package_sources(&mut output_entries, donor, opened)?;
                 }
                 AssetActionKind::MergeDatabase => {
+                    // A DataTable asset is written by its own splice path; the
+                    // two maps are disjoint, so the lookup selects the format.
+                    if let Some(parsed) = parsed_data_tables.get(&sort_key(&asset.virtual_path)) {
+                        let (uasset_entry, uexp_entry, uasset, uexp) = build_merged_data_table(
+                            current_plan,
+                            resolutions,
+                            opened,
+                            parsed,
+                            carrier_index,
+                        )?;
+                        let uasset_path = temp_dir.path().join(format!(
+                            "{}-dt-header.bin",
+                            stable_id("tmp", [asset.virtual_path.as_str()])
+                        ));
+                        let uexp_path = temp_dir.path().join(format!(
+                            "{}-dt-payload.bin",
+                            stable_id("tmp", [asset.virtual_path.as_str()])
+                        ));
+                        fs::write(&uasset_path, uasset)?;
+                        fs::write(&uexp_path, uexp)?;
+                        output_entries.push(OutputEntry {
+                            path: uasset_entry,
+                            source: OutputSource::Temporary(uasset_path),
+                        });
+                        output_entries.push(OutputEntry {
+                            path: uexp_entry,
+                            source: OutputSource::Temporary(uexp_path),
+                        });
+                        continue;
+                    }
                     let parsed = parsed_databases
                         .get(&sort_key(&asset.virtual_path))
                         .ok_or_else(|| {
@@ -2358,6 +2417,7 @@ fn analyze_unit(
                     conflicts: Vec::new(),
                     warnings: Vec::new(),
                     parsed_database: None,
+                    parsed_data_table: None,
                 });
             }
             if providers_semantically_identical(opened, providers, multithreaded, cancelled)? {
@@ -2372,11 +2432,59 @@ fn analyze_unit(
                     conflicts: Vec::new(),
                     warnings: Vec::new(),
                     parsed_database: None,
+                    parsed_data_table: None,
                 });
             }
 
             let mut warnings = Vec::new();
             if is_database_candidate(providers) {
+                let pinned_format = selected_profile_id
+                    .and_then(|id| profile_registry.game(id))
+                    .map(|game| game.format);
+                if pinned_format == Some(profiles::ProfileFormat::Ue4DataTableV1) {
+                    match analyze_data_table_group(
+                        opened,
+                        providers,
+                        carrier_index,
+                        profile_registry,
+                        selected_profile_id,
+                        cancelled,
+                        multithreaded,
+                    ) {
+                        Ok((asset, conflicts, found_warnings, providers, cached_bytes)) => {
+                            let key = sort_key(&asset.virtual_path);
+                            return Ok(AnalysisUnitOutput {
+                                asset,
+                                conflicts,
+                                warnings: found_warnings,
+                                parsed_database: None,
+                                parsed_data_table: Some((key, providers, cached_bytes)),
+                            });
+                        }
+                        Err(MergeError::DatabaseStructureMismatch(message)) => {
+                            warnings.push(format!(
+                                "{} cannot be compared row by row. Choose one Pak for the whole file group. Details: {message}",
+                                providers[0].group.base_path
+                            ));
+                            let (asset, conflict) = analyze_package_selection_group(
+                                opened,
+                                providers,
+                                ConflictKind::StructureMismatch,
+                                "The rows could not be compared. Choose one Pak for the whole file group.",
+                                multithreaded,
+                                cancelled,
+                            )?;
+                            return Ok(AnalysisUnitOutput {
+                                asset,
+                                conflicts: vec![conflict],
+                                warnings,
+                                parsed_database: None,
+                                parsed_data_table: None,
+                            });
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
                 match analyze_database_group(
                     opened,
                     providers,
@@ -2394,11 +2502,12 @@ fn analyze_unit(
                             conflicts,
                             warnings: found_warnings,
                             parsed_database: Some((key, providers, cached_bytes)),
+                            parsed_data_table: None,
                         });
                     }
                     Err(MergeError::DatabaseStructureMismatch(message)) => {
                         warnings.push(format!(
-                            "{} cannot be compared row by row because the surrounding data differs. Choose one Pak for the whole file group. Details: {message}",
+                            "{} cannot be compared row by row. Choose one Pak for the whole file group. Details: {message}",
                             providers[0].group.base_path
                         ));
                         let (asset, conflict) = analyze_package_selection_group(
@@ -2414,6 +2523,7 @@ fn analyze_unit(
                             conflicts: vec![conflict],
                             warnings,
                             parsed_database: None,
+                            parsed_data_table: None,
                         });
                     }
                     Err(MergeError::Cancelled) => return Err(MergeError::Cancelled),
@@ -2434,6 +2544,7 @@ fn analyze_unit(
                 conflicts: vec![conflict],
                 warnings,
                 parsed_database: None,
+                parsed_data_table: None,
             })
         }
         AnalysisUnit::Loose(providers) => {
@@ -2443,6 +2554,7 @@ fn analyze_unit(
                     conflicts: Vec::new(),
                     warnings: Vec::new(),
                     parsed_database: None,
+                    parsed_data_table: None,
                 });
             }
             if loose_identical(opened, providers, multithreaded, cancelled)? {
@@ -2456,6 +2568,7 @@ fn analyze_unit(
                     conflicts: Vec::new(),
                     warnings: Vec::new(),
                     parsed_database: None,
+                    parsed_data_table: None,
                 });
             }
             let conflict = make_loose_conflict(opened, providers, multithreaded, cancelled)?;
@@ -2469,6 +2582,7 @@ fn analyze_unit(
                 conflicts: vec![conflict],
                 warnings: Vec::new(),
                 parsed_database: None,
+                parsed_data_table: None,
             })
         }
     }
@@ -2493,6 +2607,9 @@ fn analyze_database_group(
     multithreaded: bool,
     detailed_progress: &mut AnalysisUnitProgressCallback<'_>,
 ) -> Result<DatabaseAnalysis> {
+    let pinned_format = selected_profile_id
+        .and_then(|id| profile_registry.game(id))
+        .map(|game| game.format);
     let parsed = {
         let mut indexing_progress = |completed: u64, total: u64, current_item: &str| {
             detailed_progress(database_analysis_phase_progress(
@@ -2510,7 +2627,17 @@ fn analyze_database_group(
             Some(&mut indexing_progress),
         )?
     };
-    let supporting_files_differ = validate_database_shell_compatibility(&parsed)?;
+    let pinned_game = selected_profile_id.and_then(|id| profile_registry.game(id));
+    let shell_spec = pinned_format.map_or_else(
+        || profiles::ProfileFormat::MessagePackMDataListV1.package_shell(),
+        profiles::ProfileFormat::package_shell,
+    );
+    let mount_roots = pinned_game.map_or_else(
+        || profile_registry.all_mount_root_prefixes(),
+        profiles::GameProfile::mount_root_prefixes,
+    );
+    let supporting_files_differ =
+        validate_database_shell_compatibility(&parsed, shell_spec, &mount_roots)?;
     let carrier_local = parsed
         .iter()
         .position(|provider| provider.input_index == global_carrier_index)
@@ -3063,7 +3190,11 @@ fn npc_string_field(row: &RowFieldIndex<'_>, field: &str) -> Result<Option<Strin
 /// Pak's file and updates only that export's structurally located SerialSize.
 /// The boolean return records that the other supporting-file bytes differ and
 /// must be surfaced as an analysis warning.
-fn validate_database_shell_compatibility(parsed: &[ParsedDbProvider]) -> Result<bool> {
+fn validate_database_shell_compatibility(
+    parsed: &[ParsedDbProvider],
+    spec: PackageShellSpec,
+    mount_roots: &[String],
+) -> Result<bool> {
     let shell_digests: BTreeSet<_> = parsed
         .iter()
         .map(|provider| database_shell_digest(&provider.asset))
@@ -3082,6 +3213,8 @@ fn validate_database_shell_compatibility(parsed: &[ParsedDbProvider]) -> Result<
                 provider.uasset.as_ref(),
                 provider.uexp_size,
                 Some(&provider.group.base_path),
+                spec,
+                mount_roots,
             )
         })
         .collect::<Result<_>>()?;
@@ -3133,54 +3266,74 @@ fn parse_uasset_shell(
     uasset: &[u8],
     uexp_size: usize,
     expected_asset_path: Option<&str>,
+    spec: PackageShellSpec,
+    mount_roots: &[String],
 ) -> Result<UassetShellDescriptor> {
     const PACKAGE_MAGIC: [u8; binary_asset::PACKAGE_TAG_SIZE] = [0xC1, 0x83, 0x2A, 0x9E];
-    const TOTAL_HEADER_SIZE_OFFSET: usize = 0x1C;
-    const FOLDER_NAME_OFFSET: usize = 0x20;
-    const PACKAGE_FLAGS: u32 = 0x8000_2200;
-    // OT0's cooked imports include the 4-byte package-name extension after
-    // the traditional 28-byte FObjectImport body.
-    const IMPORT_ENTRY_SIZE: usize = 32;
     const MAX_NAME_COUNT: usize = 100_000;
     const MAX_IMPORT_COUNT: usize = 100_000;
+    const MAX_VERSION_ZERO_RUN: usize = 32;
+
+    let total_header_size_offset = spec.total_header_size_offset;
+    let import_entry_size = spec.import_entry_size;
 
     if uasset.get(..binary_asset::PACKAGE_TAG_SIZE) != Some(PACKAGE_MAGIC.as_slice()) {
         return Err(MergeError::DatabaseStructureMismatch(
             ".uasset does not carry the expected C1 83 2A 9E package tag".to_owned(),
         ));
     }
-    if read_i32_le_at(uasset, 4) != Some(-8) {
-        return Err(MergeError::DatabaseStructureMismatch(
-            ".uasset LegacyVersion is not the expected value -8".to_owned(),
-        ));
+    if read_i32_le_at(uasset, 4) != Some(spec.legacy_version) {
+        return Err(MergeError::DatabaseStructureMismatch(format!(
+            ".uasset LegacyVersion is not the expected value {}",
+            spec.legacy_version
+        )));
     }
-    if uasset.get(8..TOTAL_HEADER_SIZE_OFFSET) != Some(&[0; 20]) {
+    let zero_run = [0_u8; MAX_VERSION_ZERO_RUN];
+    let zero_run = zero_run.get(..spec.version_zero_run_len).ok_or_else(|| {
+        MergeError::DatabaseStructureMismatch(
+            ".uasset version zero-run length is not supported".to_owned(),
+        )
+    })?;
+    if uasset.get(8..total_header_size_offset) != Some(zero_run) {
         return Err(MergeError::DatabaseStructureMismatch(
-            ".uasset version fields do not match the supported unversioned OT0 package layout"
+            ".uasset version fields do not match the supported unversioned package layout"
                 .to_owned(),
         ));
     }
-    if read_u32_le_at(uasset, TOTAL_HEADER_SIZE_OFFSET) != u32::try_from(uasset.len()).ok() {
+    if read_u32_le_at(uasset, total_header_size_offset) != u32::try_from(uasset.len()).ok() {
         return Err(MergeError::DatabaseStructureMismatch(
             ".uasset TotalHeaderSize does not equal its exact byte length".to_owned(),
         ));
     }
 
-    let (package_path, folder_end) =
-        parse_unreal_fstring(uasset, FOLDER_NAME_OFFSET, "package path")?;
-    if package_path.is_empty() || !package_path.starts_with("/Game/") {
-        return Err(MergeError::DatabaseStructureMismatch(
-            ".uasset package path is not a /Game/... path".to_owned(),
-        ));
-    }
+    let (folder_name, folder_end) =
+        parse_unreal_fstring(uasset, spec.folder_name_offset, "package path")?;
+    // UE5 cooks used by OT0 store the real package path here; UE4 cooks store
+    // the literal "None" and identify the package by its export object name.
+    let package_path = match spec.package_path_source {
+        PackagePathSource::FolderName { required_prefix } => {
+            if folder_name.is_empty() || !folder_name.starts_with(required_prefix) {
+                return Err(MergeError::DatabaseStructureMismatch(format!(
+                    ".uasset package path is not a {required_prefix}... path"
+                )));
+            }
+            folder_name
+        }
+        PackagePathSource::ExportObjectName => String::new(),
+    };
     let field_offset = |relative: usize| {
         folder_end.checked_add(relative).ok_or_else(|| {
             MergeError::DatabaseStructureMismatch(".uasset summary offset overflow".to_owned())
         })
     };
-    if read_u32_le_at(uasset, field_offset(0)?) != Some(PACKAGE_FLAGS) {
+    let package_flags = read_u32_le_at(uasset, field_offset(0)?).ok_or_else(|| {
+        MergeError::DatabaseStructureMismatch(
+            ".uasset package flags are outside the summary".to_owned(),
+        )
+    })?;
+    if package_flags & spec.package_flags_mask != spec.package_flags_value {
         return Err(MergeError::DatabaseStructureMismatch(
-            ".uasset package flags do not match the supported OT0 BinaryAsset layout".to_owned(),
+            ".uasset package flags do not match the supported cooked package layout".to_owned(),
         ));
     }
 
@@ -3194,30 +3347,31 @@ fn parse_uasset_shell(
         ".uasset name-table offset",
         uasset.len(),
     )?;
-    let export_count = read_u32_le_at(uasset, field_offset(0x1C)?).ok_or_else(|| {
-        MergeError::DatabaseStructureMismatch(".uasset export count is out of range".to_owned())
-    })?;
+    let export_count =
+        read_u32_le_at(uasset, field_offset(spec.export_count_field)?).ok_or_else(|| {
+            MergeError::DatabaseStructureMismatch(".uasset export count is out of range".to_owned())
+        })?;
     if export_count != 1 {
         return Err(MergeError::DatabaseStructureMismatch(format!(
             ".uasset has {export_count} exports; detailed database merging requires exactly one"
         )));
     }
     let export_offset = checked_u32_usize(
-        read_u32_le_at(uasset, field_offset(0x20)?),
+        read_u32_le_at(uasset, field_offset(spec.export_offset_field)?),
         ".uasset export-table offset",
         uasset.len(),
     )?;
     let import_count = checked_u32_usize(
-        read_u32_le_at(uasset, field_offset(0x24)?),
+        read_u32_le_at(uasset, field_offset(spec.import_count_field)?),
         ".uasset import count",
         MAX_IMPORT_COUNT,
     )?;
     let import_offset = checked_u32_usize(
-        read_u32_le_at(uasset, field_offset(0x28)?),
+        read_u32_le_at(uasset, field_offset(spec.import_offset_field)?),
         ".uasset import-table offset",
         uasset.len(),
     )?;
-    let bulk_data_start_offset = field_offset(0x8C)?;
+    let bulk_data_start_offset = field_offset(spec.bulk_data_start_offset_field)?;
     read_u64_le_at(uasset, bulk_data_start_offset).ok_or_else(|| {
         MergeError::DatabaseStructureMismatch(
             ".uasset BulkDataStartOffset is outside the package summary".to_owned(),
@@ -3225,7 +3379,7 @@ fn parse_uasset_shell(
     })?;
 
     let names = parse_uasset_names(uasset, name_offset, name_count)?;
-    let import_bytes = import_count.checked_mul(IMPORT_ENTRY_SIZE).ok_or_else(|| {
+    let import_bytes = import_count.checked_mul(import_entry_size).ok_or_else(|| {
         MergeError::DatabaseStructureMismatch(".uasset import-table size overflow".to_owned())
     })?;
     let import_end = import_offset.checked_add(import_bytes).ok_or_else(|| {
@@ -3261,7 +3415,7 @@ fn parse_uasset_shell(
             )
         })?;
     let class_import_offset = import_offset
-        .checked_add(import_index.checked_mul(IMPORT_ENTRY_SIZE).ok_or_else(|| {
+        .checked_add(import_index.checked_mul(import_entry_size).ok_or_else(|| {
             MergeError::DatabaseStructureMismatch(".uasset class import offset overflow".to_owned())
         })?)
         .ok_or_else(|| {
@@ -3273,29 +3427,47 @@ fn parse_uasset_shell(
         &names,
         "export class name",
     )?;
-    if !class_name.eq_ignore_ascii_case("BinaryAsset") {
+    if !class_name.eq_ignore_ascii_case(spec.expected_export_class) {
         return Err(MergeError::DatabaseStructureMismatch(format!(
-            ".uasset export class is {class_name}, not BinaryAsset"
+            ".uasset export class is {class_name}, not {}",
+            spec.expected_export_class
         )));
     }
     let object_name = uasset_fname(uasset, export_offset + 0x10, &names, "export object name")?;
 
-    let expected_object_name = package_path.rsplit('/').next().unwrap_or_default();
-    if !object_name.eq_ignore_ascii_case(expected_object_name) {
-        return Err(MergeError::DatabaseStructureMismatch(format!(
-            ".uasset export object {object_name} does not match package {expected_object_name}"
-        )));
-    }
-    if let Some(expected) = expected_asset_path {
-        let internal = package_path.strip_prefix("/Game/").unwrap_or(&package_path);
-        let expected = sort_key(expected);
-        let expected = expected
-            .strip_prefix("octopath_traveler0/content/")
-            .unwrap_or(&expected);
-        if sort_key(internal) != expected {
-            return Err(MergeError::DatabaseStructureMismatch(format!(
-                ".uasset package path {package_path} does not match Pak path {expected}"
-            )));
+    match spec.package_path_source {
+        PackagePathSource::FolderName { required_prefix } => {
+            let expected_object_name = package_path.rsplit('/').next().unwrap_or_default();
+            if !object_name.eq_ignore_ascii_case(expected_object_name) {
+                return Err(MergeError::DatabaseStructureMismatch(format!(
+                    ".uasset export object {object_name} does not match package {expected_object_name}"
+                )));
+            }
+            if let Some(expected) = expected_asset_path {
+                let internal = package_path
+                    .strip_prefix(required_prefix)
+                    .unwrap_or(&package_path);
+                let expected = sort_key(expected);
+                let expected = strip_known_mount_root(&expected, mount_roots);
+                if sort_key(internal) != expected {
+                    return Err(MergeError::DatabaseStructureMismatch(format!(
+                        ".uasset package path {package_path} does not match Pak path {expected}"
+                    )));
+                }
+            }
+        }
+        PackagePathSource::ExportObjectName => {
+            // The package path is absent from the summary, so identity is the
+            // export object name compared against the Pak entry's file stem.
+            if let Some(expected) = expected_asset_path {
+                let expected = sort_key(expected);
+                let stem = expected.rsplit('/').next().unwrap_or_default();
+                if sort_key(&object_name) != stem {
+                    return Err(MergeError::DatabaseStructureMismatch(format!(
+                        ".uasset export object {object_name} does not match Pak path {expected}"
+                    )));
+                }
+            }
         }
     }
 
@@ -4240,7 +4412,7 @@ fn build_merged_database(
     let asset_path = &carrier_provider.group.base_path;
     let mut unit_planner =
         profiles::AtomicUnitPlanner::new(profile_registry, pinned_profile_id(plan), asset_path);
-    let conflict_index = build_asset_conflict_index(plan, asset_path);
+    let conflict_index = build_asset_conflict_index(plan, asset_path)?;
     let mut raw_preserved = 0_u64;
     let mut raw_replaced = 0_u64;
 
@@ -4570,6 +4742,12 @@ fn build_merged_database(
         carrier_provider.uasset.as_ref(),
         carrier_provider.uexp_size,
         merged_uexp_size,
+        pinned_profile_id(plan)
+            .and_then(|id| profile_registry.game(id))
+            .map_or_else(
+                || profiles::ProfileFormat::MessagePackMDataListV1.package_shell(),
+                |game| game.format.package_shell(),
+            ),
     )?;
     let raw_audit = PendingRawPreservationAudit {
         asset_path: asset_path.clone(),
@@ -4873,12 +5051,18 @@ fn raw_atomic_audit_digest<'a>(
     Ok(hex::encode(digest.finalize()))
 }
 
-fn patch_serial_size(uasset: &[u8], old_uexp_size: usize, new_uexp_size: usize) -> Result<Vec<u8>> {
-    let descriptor = parse_uasset_shell(uasset, old_uexp_size, None).map_err(|error| {
-        MergeError::Verification(format!(
-            "the base Pak .uasset is not structurally valid: {error}"
-        ))
-    })?;
+fn patch_serial_size(
+    uasset: &[u8],
+    old_uexp_size: usize,
+    new_uexp_size: usize,
+    spec: PackageShellSpec,
+) -> Result<Vec<u8>> {
+    let descriptor =
+        parse_uasset_shell(uasset, old_uexp_size, None, spec, &[]).map_err(|error| {
+            MergeError::Verification(format!(
+                "the base Pak .uasset is not structurally valid: {error}"
+            ))
+        })?;
     let new_serial = new_uexp_size
         .checked_sub(binary_asset::PACKAGE_TAG_SIZE)
         .ok_or_else(|| {
@@ -4889,7 +5073,7 @@ fn patch_serial_size(uasset: &[u8], old_uexp_size: usize, new_uexp_size: usize) 
     let mut output = uasset.to_vec();
     let serial_range = descriptor.serial_size_offset..descriptor.serial_size_offset + 8;
     output[serial_range].copy_from_slice(&new_serial.to_le_bytes());
-    parse_uasset_shell(&output, new_uexp_size, None).map_err(|error| {
+    parse_uasset_shell(&output, new_uexp_size, None, spec, &[]).map_err(|error| {
         MergeError::Verification(format!(
             "the updated .uasset no longer matches the merged .uexp: {error}"
         ))
@@ -4899,7 +5083,17 @@ fn patch_serial_size(uasset: &[u8], old_uexp_size: usize, new_uexp_size: usize) 
 
 type AssetConflictIndex<'a> = BTreeMap<RowId, BTreeMap<&'a str, &'a Conflict>>;
 
-fn build_asset_conflict_index<'a>(plan: &'a MergePlan, asset_path: &str) -> AssetConflictIndex<'a> {
+/// Indexes this asset's row-scoped conflicts by their row identity.
+///
+/// A row id that does not parse is a hard error, never a skip. Dropping one
+/// would silently ignore the user's explicit choice: `indexed_conflict` would
+/// return `None`, the unit would keep the carrier value, and
+/// `expected_atomic_audit_digest` would derive its expectation from those same
+/// carrier bytes, so the post-merge stored-data check would still pass.
+fn build_asset_conflict_index<'a>(
+    plan: &'a MergePlan,
+    asset_path: &str,
+) -> Result<AssetConflictIndex<'a>> {
     let mut index = BTreeMap::new();
     for conflict in &plan.conflicts {
         if !conflict.asset_path.eq_ignore_ascii_case(asset_path) {
@@ -4908,15 +5102,18 @@ fn build_asset_conflict_index<'a>(plan: &'a MergePlan, asset_path: &str) -> Asse
         let (Some(row_id), Some(group_id)) = (&conflict.row_id, &conflict.group_id) else {
             continue;
         };
-        let Ok(row_id) = row_id.parse::<RowId>() else {
-            continue;
-        };
+        let parsed_row_id = row_id.parse::<RowId>().map_err(|_| {
+            MergeError::InvalidPlan(format!(
+                "{asset_path}: conflict {} carries row id {row_id}, which this database format cannot address",
+                conflict.id
+            ))
+        })?;
         index
-            .entry(row_id)
+            .entry(parsed_row_id)
             .or_insert_with(BTreeMap::new)
             .insert(group_id.as_str(), conflict);
     }
-    index
+    Ok(index)
 }
 
 fn indexed_conflict<'a>(
@@ -6161,8 +6358,588 @@ fn sort_key(value: &str) -> String {
     value.replace('\\', "/").to_lowercase()
 }
 
+/// Removes the game-root prefix a Pak entry may carry, so an internal package
+/// path can be compared with a Pak path. The roots come from the pinned
+/// profile's declared root scope rather than a hardcoded game name.
+fn strip_known_mount_root<'a>(path: &'a str, mount_roots: &[String]) -> &'a str {
+    mount_roots
+        .iter()
+        .find_map(|root| path.strip_prefix(root.as_str()))
+        .unwrap_or(path)
+}
+
 fn same_path(left: &Path, right: &Path) -> bool {
     resources::same_file_path(left, right)
+}
+
+/// A DataTable that cannot be read or spliced degrades to a whole-file choice,
+/// the same fail-closed path an unreadable MessagePack database takes.
+impl From<data_table_merge::DataTableMergeError> for MergeError {
+    fn from(error: data_table_merge::DataTableMergeError) -> Self {
+        Self::DatabaseStructureMismatch(error.to_string())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UE4 UDataTable databases
+//
+// A sibling of the MessagePack path rather than a generalisation of it: the two
+// formats share no bytes, and the OT0 reader's byte-for-byte guarantees are not
+// worth risking to reuse orchestration. Conflict semantics are identical — a
+// unit whose value differs between any two Paks becomes a choice.
+// ---------------------------------------------------------------------------
+
+struct DataTableProvider {
+    input_index: usize,
+    group: pak::PackageGroup,
+    image: data_table_merge::DataTableImage,
+}
+
+type DataTableAnalysis = (
+    AssetPlan,
+    Vec<Conflict>,
+    Vec<String>,
+    Vec<DataTableProvider>,
+    u64,
+);
+
+fn load_data_table_group(
+    opened: &[OpenedPak],
+    providers: &[GroupProvider],
+    multithreaded: bool,
+    cancelled: Option<&CancellationToken>,
+) -> Result<(Vec<DataTableProvider>, u64)> {
+    let mut parsed = Vec::with_capacity(providers.len());
+    let mut bytes = 0_u64;
+    for provider in providers {
+        check_cancel(cancelled)?;
+        let uasset_entry = provider
+            .group
+            .components
+            .get(&PackageComponent::Uasset)
+            .ok_or_else(|| missing_package_component(&provider.group, PackageComponent::Uasset))?;
+        let uexp_entry = provider
+            .group
+            .components
+            .get(&PackageComponent::Uexp)
+            .ok_or_else(|| missing_package_component(&provider.group, PackageComponent::Uexp))?;
+        let uasset = map_canonical_entry(
+            &opened[provider.input_index],
+            uasset_entry,
+            multithreaded,
+            cancelled,
+        )?;
+        let uexp = map_canonical_entry(
+            &opened[provider.input_index],
+            uexp_entry,
+            multithreaded,
+            cancelled,
+        )?;
+        bytes = bytes
+            .checked_add((uasset.as_ref().len() + uexp.as_ref().len()) as u64)
+            .ok_or(MergeError::SizeOverflow("data table cache"))?;
+        let image = data_table_merge::DataTableImage::parse(
+            uasset.as_ref().to_vec(),
+            uexp.as_ref().to_vec(),
+        )
+        .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+        parsed.push(DataTableProvider {
+            input_index: provider.input_index,
+            group: provider.group.clone(),
+            image,
+        });
+    }
+    Ok((parsed, bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn analyze_data_table_group(
+    opened: &[OpenedPak],
+    providers: &[GroupProvider],
+    global_carrier_index: usize,
+    profile_registry: &profiles::ProfileRegistry,
+    selected_profile_id: Option<&str>,
+    cancelled: Option<&CancellationToken>,
+    multithreaded: bool,
+) -> Result<DataTableAnalysis> {
+    let (parsed, cached_bytes) =
+        load_data_table_group(opened, providers, multithreaded, cancelled)?;
+    let carrier_local = parsed
+        .iter()
+        .position(|provider| provider.input_index == global_carrier_index)
+        .unwrap_or(0);
+    let asset_path = parsed[carrier_local].group.base_path.clone();
+    let resolved = profile_registry.resolve_asset(&asset_path, selected_profile_id);
+    let profile = resolved.profile;
+
+    // Everything outside the row list is carried from the base Pak, so it must
+    // be identical or the merge would silently drop another Pak's change.
+    let carrier = &parsed[carrier_local].image;
+    let carrier_object_block = &carrier.body()[carrier.index.object_block.clone()];
+    for provider in &parsed {
+        let block = &provider.image.body()[provider.image.index.object_block.clone()];
+        if block != carrier_object_block {
+            return Err(MergeError::DatabaseStructureMismatch(
+                "the data outside the row list differs between Paks".to_owned(),
+            ));
+        }
+    }
+
+    let mut conflicts = Vec::new();
+    let mut warnings = Vec::new();
+
+    let mut donor_only: Vec<Arc<str>> = Vec::new();
+    for (local, provider) in parsed.iter().enumerate() {
+        if local == carrier_local {
+            continue;
+        }
+        for row in &provider.image.index.rows {
+            if carrier.index.row_index(&row.name).is_none()
+                && !donor_only
+                    .iter()
+                    .any(|name| name.as_ref() == row.name.as_ref())
+            {
+                donor_only.push(Arc::clone(&row.name));
+            }
+        }
+    }
+    if !donor_only.is_empty() {
+        warnings.push(format!(
+            "{asset_path}: {} row(s) appear in only some Paks. Pak Merger keeps the union because a Pak alone cannot prove that a missing row was intentionally deleted.",
+            donor_only.len()
+        ));
+    }
+
+    for (row_index, span) in carrier.index.rows.iter().enumerate() {
+        check_cancel(cancelled)?;
+        let carrier_layout = carrier.row_layout(row_index)?;
+        let field_names: Vec<String> = carrier_layout
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        let units = data_table_merge::atomic_units_for_row(profile, &span.name, &field_names)
+            .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+
+        // Providers whose row has a different property sequence cannot be
+        // compared field by field, so the whole row becomes one choice.
+        let mut comparable = Vec::new();
+        let mut shape_mismatch = false;
+        for (local, provider) in parsed.iter().enumerate() {
+            if local == carrier_local {
+                continue;
+            }
+            let Some(donor_row) = provider.image.index.row_index(&span.name) else {
+                continue;
+            };
+            let layout = provider.image.row_layout(donor_row)?;
+            if layout
+                .field_names()
+                .ne(field_names.iter().map(String::as_str))
+            {
+                shape_mismatch = true;
+                continue;
+            }
+            comparable.push((local, layout));
+        }
+        if shape_mismatch {
+            warnings.push(format!(
+                "{asset_path}: row {} has different properties between Paks, so it is chosen as a whole row.",
+                span.name
+            ));
+            conflicts.push(data_table_whole_row_conflict(
+                opened,
+                &parsed,
+                &asset_path,
+                &span.name,
+                carrier_local,
+                &carrier_layout,
+                &field_names,
+            )?);
+            continue;
+        }
+
+        for unit in &units {
+            let carrier_digest = carrier
+                .unit_semantic_digest(&carrier_layout, &unit.fields)
+                .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+            let mut differs = false;
+            for (local, layout) in &comparable {
+                let digest = parsed[*local]
+                    .image
+                    .unit_semantic_digest(layout, &unit.fields)
+                    .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+                if digest != carrier_digest {
+                    differs = true;
+                }
+            }
+            if !differs {
+                continue;
+            }
+            let mut variants = vec![data_table_variant(
+                opened,
+                &parsed[carrier_local],
+                &asset_path,
+                &span.name,
+                &unit.id,
+                &carrier_layout,
+                &unit.fields,
+            )?];
+            for (local, layout) in &comparable {
+                variants.push(data_table_variant(
+                    opened,
+                    &parsed[*local],
+                    &asset_path,
+                    &span.name,
+                    &unit.id,
+                    layout,
+                    &unit.fields,
+                )?);
+            }
+            conflicts.push(make_conflict_with_row_text(
+                if unit.compound {
+                    ConflictKind::AtomicGroup
+                } else {
+                    ConflictKind::FieldValue
+                },
+                &asset_path,
+                &span.name,
+                Some(&unit.id),
+                &format!("{asset_path} row {} {} differs.", span.name, unit.id),
+                variants,
+                true,
+            ));
+        }
+    }
+
+    // A row only some Paks have is appended. If those Paks disagree about it,
+    // the whole row becomes one choice.
+    for row_name in &donor_only {
+        let mut digests = BTreeSet::new();
+        let mut layouts = Vec::new();
+        for (local, provider) in parsed.iter().enumerate() {
+            let Some(row_index) = provider.image.index.row_index(row_name) else {
+                continue;
+            };
+            let layout = provider.image.row_layout(row_index)?;
+            let fields: Vec<String> = layout
+                .fields
+                .iter()
+                .map(|field| field.name.clone())
+                .collect();
+            let digest = provider
+                .image
+                .unit_semantic_digest(&layout, &fields)
+                .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+            digests.insert(digest);
+            layouts.push((local, layout, fields));
+        }
+        if digests.len() <= 1 {
+            continue;
+        }
+        let mut variants = Vec::new();
+        for (local, layout, fields) in &layouts {
+            variants.push(data_table_variant(
+                opened,
+                &parsed[*local],
+                &asset_path,
+                row_name,
+                "__whole_row__",
+                layout,
+                fields,
+            )?);
+        }
+        conflicts.push(make_conflict_with_row_text(
+            ConflictKind::AtomicGroup,
+            &asset_path,
+            row_name,
+            Some("__whole_row__"),
+            &format!("{asset_path} added row {row_name} differs between Paks."),
+            variants,
+            true,
+        ));
+    }
+
+    let conflict_ids = conflicts
+        .iter()
+        .map(|conflict| conflict.id.clone())
+        .collect();
+    let asset = package_asset_plan(
+        providers,
+        opened,
+        AssetActionKind::MergeDatabase,
+        conflict_ids,
+        warnings.clone(),
+    );
+    Ok((asset, conflicts, warnings, parsed, cached_bytes))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn data_table_variant(
+    opened: &[OpenedPak],
+    provider: &DataTableProvider,
+    asset_path: &str,
+    row_name: &str,
+    group_id: &str,
+    layout: &crate::data_table::RowLayout,
+    fields: &[String],
+) -> Result<Variant> {
+    let input = &opened[provider.input_index].descriptor;
+    let semantic_sha256 = provider
+        .image
+        .unit_semantic_digest(layout, fields)
+        .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+    // Raw bytes identify the exact encoding the merged output copies; the
+    // semantic digest is what decides whether there is a conflict at all.
+    let mut raw = Sha256::new();
+    for name in fields {
+        if let Some(field) = layout.field(name) {
+            update_framed(&mut raw, &provider.image.body()[field.range.clone()]);
+        }
+    }
+    let raw_sha256 = hex::encode(raw.finalize());
+    Ok(Variant {
+        id: stable_id(
+            "variant",
+            [asset_path, row_name, group_id, &input.id, &raw_sha256],
+        ),
+        label: input.display_name.clone(),
+        input_id: input.id.clone(),
+        raw_sha256: raw_sha256.clone(),
+        semantic_sha256,
+        preview: provider.image.unit_preview(layout, fields),
+        marker: "ue4-datatable".to_owned(),
+        provenance: Provenance {
+            input_id: input.id.clone(),
+            input_path: input.path.clone(),
+            entry_path: provider
+                .group
+                .components
+                .get(&PackageComponent::Uexp)
+                .cloned(),
+            raw_sha256,
+        },
+    })
+}
+
+fn data_table_whole_row_conflict(
+    opened: &[OpenedPak],
+    parsed: &[DataTableProvider],
+    asset_path: &str,
+    row_name: &str,
+    carrier_local: usize,
+    carrier_layout: &crate::data_table::RowLayout,
+    carrier_fields: &[String],
+) -> Result<Conflict> {
+    let mut variants = vec![data_table_variant(
+        opened,
+        &parsed[carrier_local],
+        asset_path,
+        row_name,
+        "__whole_row__",
+        carrier_layout,
+        carrier_fields,
+    )?];
+    for (local, provider) in parsed.iter().enumerate() {
+        if local == carrier_local {
+            continue;
+        }
+        let Some(row_index) = provider.image.index.row_index(row_name) else {
+            continue;
+        };
+        let layout = provider.image.row_layout(row_index)?;
+        let fields: Vec<String> = layout
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        variants.push(data_table_variant(
+            opened,
+            provider,
+            asset_path,
+            row_name,
+            "__whole_row__",
+            &layout,
+            &fields,
+        )?);
+    }
+    Ok(make_conflict_with_row_text(
+        ConflictKind::StructureMismatch,
+        asset_path,
+        row_name,
+        Some("__whole_row__"),
+        &format!("{asset_path} row {row_name} has different properties between Paks."),
+        variants,
+        true,
+    ))
+}
+
+/// Same shape as `make_conflict`, but the row identity is a name rather than an
+/// integer, so it is carried through as text.
+fn make_conflict_with_row_text(
+    kind: ConflictKind,
+    asset_path: &str,
+    row_name: &str,
+    group_id: Option<&str>,
+    message: &str,
+    mut variants: Vec<Variant>,
+    blocking: bool,
+) -> Conflict {
+    variants.sort_by(|left, right| {
+        left.input_id
+            .cmp(&right.input_id)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let id = stable_id(
+        "conflict",
+        std::iter::once(asset_path)
+            .chain(std::iter::once(row_name))
+            .chain(std::iter::once(group_id.unwrap_or_default()))
+            .chain(variants.iter().map(|variant| variant.id.as_str())),
+    );
+    Conflict {
+        id,
+        kind,
+        asset_path: asset_path.to_owned(),
+        row_id: Some(row_name.to_owned()),
+        group_id: group_id.map(str::to_owned),
+        message: message.to_owned(),
+        variants,
+        blocking,
+    }
+}
+
+/// Applies the user's choices and writes the merged `UDataTable` pair.
+fn build_merged_data_table(
+    plan: &MergePlan,
+    resolutions: &ResolutionSet,
+    opened: &[OpenedPak],
+    parsed: &[DataTableProvider],
+    global_carrier_index: usize,
+) -> Result<(String, String, Vec<u8>, Vec<u8>)> {
+    let carrier_local = parsed
+        .iter()
+        .position(|provider| provider.input_index == global_carrier_index)
+        .unwrap_or(0);
+    let carrier = &parsed[carrier_local];
+    let asset_path = &carrier.group.base_path;
+
+    let donors: Vec<&data_table_merge::DataTableImage> =
+        parsed.iter().map(|provider| &provider.image).collect();
+    let local_of_input = |input_id: &str| -> Option<usize> {
+        parsed
+            .iter()
+            .position(|provider| opened[provider.input_index].descriptor.id == input_id)
+    };
+
+    let mut selections = data_table_merge::DataTableSelections::default();
+    for conflict in &plan.conflicts {
+        if !conflict.asset_path.eq_ignore_ascii_case(asset_path) {
+            continue;
+        }
+        let (Some(row_name), Some(group_id)) = (&conflict.row_id, &conflict.group_id) else {
+            continue;
+        };
+        let input_id = selected_input_id(conflict, resolutions)?;
+        let donor = local_of_input(input_id).ok_or_else(|| {
+            MergeError::InvalidResolution(format!(
+                "{asset_path}: no input {input_id} for row {row_name}"
+            ))
+        })?;
+        if group_id == "__whole_row__" {
+            if carrier.image.index.row_index(row_name).is_some() {
+                // A whole-row choice on an existing row replaces every field.
+                let row_index = carrier
+                    .image
+                    .index
+                    .row_index(row_name)
+                    .expect("row is present");
+                for field in carrier.image.row_layout(row_index)?.fields {
+                    selections
+                        .fields
+                        .insert((row_name.clone(), field.name), donor);
+                }
+            } else {
+                selections.appended_rows.push((row_name.clone(), donor));
+            }
+            continue;
+        }
+        // Unit ids are "group:<id>" or "field:<name>"; both are resolved back to
+        // their field list from the carrier's own layout, so the plan never has
+        // to carry the field names.
+        let row_index = carrier.image.index.row_index(row_name).ok_or_else(|| {
+            MergeError::InvalidPlan(format!("{asset_path}: base Pak has no row {row_name}"))
+        })?;
+        let layout = carrier.image.row_layout(row_index)?;
+        let names: Vec<String> = layout
+            .fields
+            .iter()
+            .map(|field| field.name.clone())
+            .collect();
+        let profile_units = data_table_merge::atomic_units_for_row(
+            crate::profiles::default_registry()
+                .resolve_asset(asset_path, plan.selected_profile_id.as_deref())
+                .profile,
+            row_name,
+            &names,
+        )
+        .map_err(|error| MergeError::DatabaseStructureMismatch(error.to_string()))?;
+        let unit = profile_units
+            .iter()
+            .find(|unit| unit.id == *group_id)
+            .ok_or_else(|| {
+                MergeError::InvalidPlan(format!("{asset_path}: unknown unit {group_id}"))
+            })?;
+        for field in &unit.fields {
+            selections
+                .fields
+                .insert((row_name.clone(), field.clone()), donor);
+        }
+    }
+
+    // Rows only donors have and that every holder agrees on are appended
+    // without a choice, in a deterministic order.
+    let mut agreed: Vec<(String, usize)> = Vec::new();
+    for (local, provider) in parsed.iter().enumerate() {
+        if local == carrier_local {
+            continue;
+        }
+        for row in &provider.image.index.rows {
+            let name = row.name.to_string();
+            if carrier.image.index.row_index(&name).is_some()
+                || selections
+                    .appended_rows
+                    .iter()
+                    .any(|(existing, _)| *existing == name)
+                || agreed.iter().any(|(existing, _)| *existing == name)
+            {
+                continue;
+            }
+            agreed.push((name, local));
+        }
+    }
+    agreed.sort_by(|left, right| left.0.cmp(&right.0));
+    selections.appended_rows.extend(agreed);
+    selections
+        .appended_rows
+        .sort_by(|left, right| left.0.cmp(&right.0));
+
+    let merged = data_table_merge::merge_data_table(&carrier.image, &donors, &selections)
+        .map_err(|error| MergeError::Verification(error.to_string()))?;
+
+    let uasset_entry = carrier
+        .group
+        .components
+        .get(&PackageComponent::Uasset)
+        .cloned()
+        .ok_or_else(|| missing_package_component(&carrier.group, PackageComponent::Uasset))?;
+    let uexp_entry = carrier
+        .group
+        .components
+        .get(&PackageComponent::Uexp)
+        .cloned()
+        .ok_or_else(|| missing_package_component(&carrier.group, PackageComponent::Uexp))?;
+    Ok((uasset_entry, uexp_entry, merged.uasset, merged.uexp))
 }
 
 #[cfg(test)]
@@ -7175,8 +7952,21 @@ mod tests {
         let mut uasset = uasset_with_metadata(base, old_size, 0x11, None, 16);
         let unrelated_offset = uasset.len() - 8;
         uasset[unrelated_offset..].copy_from_slice(&old_serial.to_le_bytes());
-        let descriptor = parse_uasset_shell(&uasset, old_size, Some(base)).unwrap();
-        let patched = patch_serial_size(&uasset, old_size, new_size).unwrap();
+        let descriptor = parse_uasset_shell(
+            &uasset,
+            old_size,
+            Some(base),
+            PackageShellSpec::OT0_UE5_BINARY_ASSET,
+            &[String::from("octopath_traveler0/content/")],
+        )
+        .unwrap();
+        let patched = patch_serial_size(
+            &uasset,
+            old_size,
+            new_size,
+            PackageShellSpec::OT0_UE5_BINARY_ASSET,
+        )
+        .unwrap();
         assert_eq!(
             &patched[descriptor.serial_size_offset..descriptor.serial_size_offset + 8],
             &((new_size - binary_asset::PACKAGE_TAG_SIZE) as u64).to_le_bytes()
@@ -7203,12 +7993,25 @@ mod tests {
         let header_size = first.len() as u64;
         let uasset =
             uasset_with_metadata(base, old_uexp_size, 0x11, Some(header_size + old_serial), 0);
-        let descriptor = parse_uasset_shell(&uasset, old_uexp_size, Some(base)).unwrap();
+        let descriptor = parse_uasset_shell(
+            &uasset,
+            old_uexp_size,
+            Some(base),
+            PackageShellSpec::OT0_UE5_BINARY_ASSET,
+            &[String::from("octopath_traveler0/content/")],
+        )
+        .unwrap();
         let original_bulk = uasset
             [descriptor._bulk_data_start_offset..descriptor._bulk_data_start_offset + 8]
             .to_vec();
 
-        let patched = patch_serial_size(&uasset, old_uexp_size, new_uexp_size).unwrap();
+        let patched = patch_serial_size(
+            &uasset,
+            old_uexp_size,
+            new_uexp_size,
+            PackageShellSpec::OT0_UE5_BINARY_ASSET,
+        )
+        .unwrap();
         assert_eq!(
             &patched[descriptor._bulk_data_start_offset..descriptor._bulk_data_start_offset + 8],
             original_bulk
@@ -7216,7 +8019,15 @@ mod tests {
 
         let mut malformed = uasset.clone();
         malformed[0] ^= 0x7F;
-        assert!(patch_serial_size(&malformed, old_uexp_size, old_uexp_size).is_err());
+        assert!(
+            patch_serial_size(
+                &malformed,
+                old_uexp_size,
+                old_uexp_size,
+                PackageShellSpec::OT0_UE5_BINARY_ASSET
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -7603,6 +8414,326 @@ mod tests {
             error.to_string().contains("leaves its game folder"),
             "unexpected error: {error}"
         );
+    }
+
+    /// Builds one synthetic OCTOPATH TRAVELER II mod Pak.
+    fn write_ot2_pak(
+        path: &Path,
+        rows: &[(&'static str, i32, &'static str)],
+    ) -> (Vec<u8>, Vec<u8>) {
+        use crate::testing::datatable::{TableSpec, build_table};
+        let (uasset, uexp) = build_table(&TableSpec::new(rows));
+        write_versioned_test_pak(
+            path,
+            repak::Version::V11,
+            "../../../Octopath_Traveler2/Content/",
+            [
+                (format!("{OT2_TABLE}.uasset"), uasset.clone()),
+                (format!("{OT2_TABLE}.uexp"), uexp.clone()),
+            ],
+        );
+        (uasset, uexp)
+    }
+
+    const OT2_TABLE: &str = "Battle/Database/EnemyGroupData";
+
+    /// Reads a row's `Amount` and `Label` out of a merged OT2 table.
+    fn ot2_row_values(uasset: &[u8], uexp: &[u8], row: &str) -> (i32, String) {
+        let image =
+            crate::data_table_merge::DataTableImage::parse(uasset.to_vec(), uexp.to_vec()).unwrap();
+        let index = image.index.row_index(row).expect("row is present");
+        let layout = image.row_layout(index).unwrap();
+        let body = image.body();
+        let amount_field = layout.field("Amount").unwrap();
+        let amount = i32::from_le_bytes(
+            body[amount_field.range.end - 4..amount_field.range.end]
+                .try_into()
+                .unwrap(),
+        );
+        let label_field = layout.field("Label").unwrap();
+        let name_index = i32::from_le_bytes(
+            body[label_field.range.end - 8..label_field.range.end - 4]
+                .try_into()
+                .unwrap(),
+        );
+        let label = image
+            .package
+            .name(name_index as usize)
+            .expect("label resolves")
+            .to_owned();
+        (amount, label)
+    }
+
+    #[test]
+    fn ot2_paks_merge_field_by_field_and_only_the_same_field_needs_a_choice() {
+        // End-to-end for the second database format: two OCTOPATH TRAVELER II
+        // mod Paks are identified, compared property by property, and written
+        // back as a valid cooked UDataTable package.
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("OT2Base_P.pak");
+        let other = temp.path().join("OT2Other_P.pak");
+
+        // ROW_A: each Pak edits a different property, so both survive.
+        // ROW_B: both edit Amount differently, so the user must choose.
+        write_ot2_pak(&base, &[("ROW_A", 10, "Base"), ("ROW_B", 1, "Shared")]);
+        write_ot2_pak(&other, &[("ROW_A", 10, "Other"), ("ROW_B", 2, "Shared")]);
+
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![base.clone(), other.clone()],
+            carrier_path: base.clone(),
+        })
+        .unwrap();
+
+        assert_eq!(
+            plan.selected_profile_id.as_deref(),
+            Some("octopath_traveler_2")
+        );
+        let asset = plan
+            .assets
+            .iter()
+            .find(|asset| asset.virtual_path.eq_ignore_ascii_case(OT2_TABLE))
+            .expect("the table is planned");
+        assert_eq!(asset.action, AssetActionKind::MergeDatabase);
+
+        // Exactly two properties differ, and each is its own choice.
+        let mut units: Vec<&str> = plan
+            .conflicts
+            .iter()
+            .map(|conflict| conflict.group_id.as_deref().unwrap_or_default())
+            .collect();
+        units.sort_unstable();
+        assert_eq!(units, ["field:Amount", "field:Label"]);
+        let label_conflict = plan
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.group_id.as_deref() == Some("field:Label"))
+            .unwrap();
+        assert_eq!(label_conflict.row_id.as_deref(), Some("ROW_A"));
+        let amount_conflict = plan
+            .conflicts
+            .iter()
+            .find(|conflict| conflict.group_id.as_deref() == Some("field:Amount"))
+            .unwrap();
+        assert_eq!(amount_conflict.row_id.as_deref(), Some("ROW_B"));
+
+        // Take the donor's label and the base Pak's amount.
+        let donor_id = plan.inputs[1].id.clone();
+        let base_id = plan.inputs[0].id.clone();
+        let mut choices = BTreeMap::new();
+        choices.insert(
+            label_conflict.id.clone(),
+            label_conflict
+                .variants
+                .iter()
+                .find(|variant| variant.input_id == donor_id)
+                .unwrap()
+                .id
+                .clone(),
+        );
+        choices.insert(
+            amount_conflict.id.clone(),
+            amount_conflict
+                .variants
+                .iter()
+                .find(|variant| variant.input_id == base_id)
+                .unwrap()
+                .id
+                .clone(),
+        );
+
+        let output = temp.path().join("OT2Merged_P.pak");
+        write(
+            resolve(
+                plan.clone(),
+                ResolutionSet {
+                    plan_id: plan.plan_id.clone(),
+                    choices,
+                },
+            )
+            .unwrap(),
+            &output,
+        )
+        .unwrap();
+
+        let archive = PakArchive::open(&output).unwrap();
+        let uasset = archive.read_entry(&format!("{OT2_TABLE}.uasset")).unwrap();
+        let uexp = archive.read_entry(&format!("{OT2_TABLE}.uexp")).unwrap();
+
+        // The chosen donor label was retargeted into the merged name table, and
+        // the untouched amount kept the base Pak's value.
+        assert_eq!(
+            ot2_row_values(&uasset, &uexp, "ROW_A"),
+            (10, "Other".to_owned())
+        );
+        assert_eq!(
+            ot2_row_values(&uasset, &uexp, "ROW_B"),
+            (1, "Shared".to_owned())
+        );
+    }
+
+    #[test]
+    fn choosing_the_base_pak_everywhere_reproduces_its_ot2_bytes_exactly() {
+        // The lossless guarantee: if the user takes the base Pak for every
+        // choice, the merged package must be the base Pak's bytes. Anything
+        // else would mean the writer re-encoded something it only had to copy.
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("OT2RoundBase_P.pak");
+        let other = temp.path().join("OT2RoundOther_P.pak");
+        let (base_uasset, base_uexp) =
+            write_ot2_pak(&base, &[("ROW_A", 1, "Alpha"), ("ROW_B", 2, "Beta")]);
+        write_ot2_pak(&other, &[("ROW_A", 99, "Gamma"), ("ROW_B", 2, "Beta")]);
+
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![base.clone(), other.clone()],
+            carrier_path: base.clone(),
+        })
+        .unwrap();
+        assert!(!plan.conflicts.is_empty());
+
+        let base_id = plan.inputs[0].id.clone();
+        let choices = plan
+            .conflicts
+            .iter()
+            .map(|conflict| {
+                let variant = conflict
+                    .variants
+                    .iter()
+                    .find(|variant| variant.input_id == base_id)
+                    .expect("the base Pak is always a variant");
+                (conflict.id.clone(), variant.id.clone())
+            })
+            .collect();
+
+        let output = temp.path().join("OT2RoundMerged_P.pak");
+        write(
+            resolve(
+                plan.clone(),
+                ResolutionSet {
+                    plan_id: plan.plan_id.clone(),
+                    choices,
+                },
+            )
+            .unwrap(),
+            &output,
+        )
+        .unwrap();
+
+        let archive = PakArchive::open(&output).unwrap();
+        assert_eq!(
+            archive.read_entry(&format!("{OT2_TABLE}.uexp")).unwrap(),
+            base_uexp,
+            "the payload was not reproduced byte for byte"
+        );
+        assert_eq!(
+            archive.read_entry(&format!("{OT2_TABLE}.uasset")).unwrap(),
+            base_uasset,
+            "the header was not reproduced byte for byte"
+        );
+    }
+
+    #[test]
+    fn an_ot2_row_only_one_pak_has_is_appended_without_a_choice() {
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().join("OT2RowBase_P.pak");
+        let other = temp.path().join("OT2RowOther_P.pak");
+        write_ot2_pak(&base, &[("ROW_A", 1, "Alpha")]);
+        write_ot2_pak(&other, &[("ROW_A", 1, "Alpha"), ("ROW_NEW", 5, "Added")]);
+
+        let plan = analyze(AnalysisRequest {
+            pak_paths: vec![base.clone(), other.clone()],
+            carrier_path: base.clone(),
+        })
+        .unwrap();
+
+        // Nothing overlaps, so the added row needs no decision.
+        assert!(
+            plan.conflicts.is_empty(),
+            "unexpected conflicts: {:?}",
+            plan.conflicts
+        );
+        assert!(
+            plan.warnings
+                .iter()
+                .any(|warning| warning.contains("only some Paks")),
+            "the union is not explained: {:?}",
+            plan.warnings
+        );
+
+        let output = temp.path().join("OT2RowMerged_P.pak");
+        write(
+            resolve(
+                plan.clone(),
+                ResolutionSet {
+                    plan_id: plan.plan_id.clone(),
+                    ..ResolutionSet::default()
+                },
+            )
+            .unwrap(),
+            &output,
+        )
+        .unwrap();
+
+        let archive = PakArchive::open(&output).unwrap();
+        let uasset = archive.read_entry(&format!("{OT2_TABLE}.uasset")).unwrap();
+        let uexp = archive.read_entry(&format!("{OT2_TABLE}.uexp")).unwrap();
+        let image =
+            crate::data_table_merge::DataTableImage::parse(uasset.clone(), uexp.clone()).unwrap();
+        assert_eq!(image.index.rows.len(), 2);
+        assert_eq!(
+            ot2_row_values(&uasset, &uexp, "ROW_NEW"),
+            (5, "Added".to_owned())
+        );
+        // The appended row's new names were added to the base Pak's table, so
+        // the header grew and every original index still resolves.
+        assert_eq!(image.package.name(0), Some("None"));
+    }
+
+    #[test]
+    fn a_row_id_the_format_cannot_address_is_an_error_not_a_silent_skip() {
+        // Guards the string-row-key work: a conflict whose row id does not parse
+        // must stop the merge. Dropping it would keep the carrier value while
+        // the audit digest, derived from those same carrier bytes, still passed.
+        let asset_path = "Local/DataBase/Test";
+        let unaddressable = Conflict {
+            id: "conflict-row-name".to_owned(),
+            kind: ConflictKind::FieldValue,
+            asset_path: asset_path.to_owned(),
+            row_id: Some("ENE_BOS_EXT_LOW_010".to_owned()),
+            group_id: Some("field:x".to_owned()),
+            message: "test".to_owned(),
+            variants: Vec::new(),
+            blocking: true,
+        };
+        let plan = MergePlan {
+            schema_version: 1,
+            plan_id: "p".to_owned(),
+            request: AnalysisRequest {
+                pak_paths: vec![PathBuf::from("a.pak")],
+                carrier_path: PathBuf::from("a.pak"),
+            },
+            inputs: vec![],
+            carrier_input_id: "a".to_owned(),
+            assets: vec![],
+            conflicts: vec![unaddressable],
+            warnings: vec![],
+            selected_profile_id: None,
+            profile_detection_status: None,
+            encoding_drift_count: 0,
+            full_reencode_forbidden: true,
+        };
+
+        let error = build_asset_conflict_index(&plan, asset_path).unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains("ENE_BOS_EXT_LOW_010") && message.contains("cannot address"),
+            "unexpected error: {message}"
+        );
+
+        // An integer row id still indexes normally.
+        let mut numeric = plan;
+        numeric.conflicts[0].row_id = Some("994011".to_owned());
+        let index = build_asset_conflict_index(&numeric, asset_path).unwrap();
+        assert!(index.contains_key(&994_011));
     }
 
     #[test]
@@ -8263,8 +9394,13 @@ mod tests {
         let report = write(resolved, &output).unwrap();
         assert!(report.verification_passed);
         let archive = PakArchive::open(output).unwrap();
-        let expected_uasset =
-            patch_serial_size(&carrier_uasset, carrier_uexp_size, donor_uexp_size).unwrap();
+        let expected_uasset = patch_serial_size(
+            &carrier_uasset,
+            carrier_uexp_size,
+            donor_uexp_size,
+            PackageShellSpec::OT0_UE5_BINARY_ASSET,
+        )
+        .unwrap();
         assert_eq!(archive.read_entry(&uasset_path).unwrap(), expected_uasset);
     }
 

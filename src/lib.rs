@@ -2,6 +2,8 @@
 
 pub mod binary_asset;
 pub mod control;
+pub mod data_table;
+pub mod data_table_merge;
 pub mod eula;
 pub mod input;
 pub mod merge;
@@ -9,7 +11,10 @@ pub mod pak;
 pub mod profiles;
 pub mod report;
 pub mod resources;
+#[cfg(test)]
+mod testing;
 pub mod types;
+pub mod ue_package;
 
 pub use control::CancellationToken;
 pub use input::{InspectError, inspect};

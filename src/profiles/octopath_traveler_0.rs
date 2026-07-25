@@ -8,6 +8,7 @@ mod default;
 mod enemy;
 mod event;
 mod game_text;
+mod npc;
 mod skill;
 
 use super::{
@@ -25,6 +26,7 @@ pub(super) fn game_profile() -> GameProfile {
     assets.extend(skill::asset_rules());
     assets.extend(event::asset_rules());
     assets.extend(game_text::asset_rules());
+    assets.extend(npc::asset_rules());
     assets.push(default::asset_rule());
 
     GameProfile {
