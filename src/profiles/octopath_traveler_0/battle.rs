@@ -1,28 +1,45 @@
-use super::{audited_asset, condition_parameters, indexed, matcher, suffix, whole};
-use crate::profiles::{AssetProfileRule, PathMatchKind};
+use super::{ai_condition_parameters, audited_asset, indexed, suffix, whole};
+use crate::profiles::AssetProfileRule;
 
 pub(super) fn asset_rules() -> Vec<AssetProfileRule> {
     vec![
+        // The four AIBattle tables have disjoint schemas, so they need one rule
+        // each. A single `/local/database/aibattle/` rule declaring the union of
+        // their groups can never be fully observed by any one table, and the
+        // strict profile then rejects the asset as schema drift and demotes it
+        // to a whole-file choice.
         audited_asset(
-            "aibattle",
-            vec![matcher(
-                PathMatchKind::Contains,
-                "/local/database/aibattle/",
-            )],
+            "aibattle_tactical_action_list",
+            suffix("/local/database/aibattle/tacticalactionlist"),
             vec![
-                whole("tactical_skill_slots", &["m_UseSkills"]),
-                whole("tactical_assignments", &["m_Tactics"]),
                 whole(
                     "tactical_action_indices",
                     &["m_TacticalList", "m_SkillIndex", "m_FriendlyIndex"],
                 ),
+                ai_condition_parameters(true),
+            ],
+        ),
+        audited_asset(
+            "aibattle_tactical_assign_list",
+            suffix("/local/database/aibattle/tacticalassignlist"),
+            vec![whole("tactical_assignments", &["m_Tactics"])],
+        ),
+        audited_asset(
+            "aibattle_tactical_list",
+            suffix("/local/database/aibattle/tacticallist"),
+            vec![
                 whole("presage_skill", &["m_Presage", "m_PresageSkillID"]),
                 whole(
                     "event_flag_pair",
                     &["m_OnEventFlgIndex", "m_OffEventFlgIndex"],
                 ),
-                condition_parameters(true),
+                ai_condition_parameters(true),
             ],
+        ),
+        audited_asset(
+            "aibattle_tactical_skill_list",
+            suffix("/local/database/aibattle/tacticalskilllist"),
+            vec![whole("tactical_skill_slots", &["m_UseSkills"])],
         ),
         audited_asset(
             "battle_event_command",

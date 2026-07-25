@@ -1855,6 +1855,9 @@ mod tests {
 
     #[test]
     fn couples_parallel_condition_arrays() {
+        // AIBattle rows carry the condition block without `m_Equipment`; that
+        // field exists only on the Skill condition tables. Keep the fixture on
+        // the real schema so the group stays fully observed.
         let row_raw = map(&[
             ("m_id", vec![1]),
             ("m_Conditions", vec![0x91, 1]),
@@ -1863,7 +1866,6 @@ mod tests {
             ("m_StatusTypes", vec![0x91, 4]),
             ("m_WeaponTypes", vec![0x91, 5]),
             ("m_MagicTypes", vec![0x91, 6]),
-            ("m_Equipment", vec![0x91, 7]),
             ("m_PrioritySkill", vec![0xc3]),
         ]);
         let row = parse_messagepack(&row_raw).unwrap();
@@ -1888,7 +1890,6 @@ mod tests {
                 "m_StatusTypes",
                 "m_WeaponTypes",
                 "m_MagicTypes",
-                "m_Equipment",
             ]
         );
         assert!(condition.compound);

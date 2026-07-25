@@ -121,3 +121,23 @@ fn condition_parameters(index_coupled: bool) -> AtomicGroupRule {
         index_coupled,
     )
 }
+
+/// AIBattle rows carry the same condition/parameter block **without**
+/// `m_Equipment`, which exists only on `Skill/SkillConditionList` and
+/// `Skill/SkillAvailMagnificationConditionList`. Declaring the seven-field
+/// group for AIBattle would make every row partially present, which the strict
+/// profile rejects outright.
+fn ai_condition_parameters(index_coupled: bool) -> AtomicGroupRule {
+    group(
+        "condition_parameters",
+        &[
+            "m_Conditions",
+            "m_Params",
+            "m_AilmentTypes",
+            "m_StatusTypes",
+            "m_WeaponTypes",
+            "m_MagicTypes",
+        ],
+        index_coupled,
+    )
+}

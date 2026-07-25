@@ -283,6 +283,17 @@ impl Entry {
             .map_err(|_| Error::Other("compression block count does not fit usize".to_owned()))?;
         let compression_slot = get_compression_slot(version, compression_slots, compression)?;
         let stream_position = writer.stream_position()?;
+        // A single block covers the whole entry, so UE records the uncompressed
+        // size as the block size rather than the Pak-wide value. UnrealPak
+        // rejects an entry that disagrees ("PakEntry mismatch"), so match the
+        // engine here instead of carrying `layout.block_size` through.
+        let entry_block_size = if block_count == 1 {
+            u32::try_from(total).map_err(|_| {
+                Error::Other("single compression block is too large".to_owned())
+            })?
+        } else {
+            layout.block_size
+        };
         let mut entry = Entry {
             offset: stream_position,
             compressed: 0,
@@ -292,7 +303,7 @@ impl Entry {
             hash: Some(Hash::default()),
             blocks: Some(vec![Block::default(); block_count]),
             flags: 0,
-            compression_block_size: layout.block_size,
+            compression_block_size: entry_block_size,
         };
         entry.write(writer, version, EntryLocation::Data)?;
         let data_start = writer.stream_position()?;
@@ -508,6 +519,19 @@ impl Entry {
             None => uncompressed,
             _ => var_int(29)?,
         };
+
+        // A single compression block covers the whole entry, so UE's encoder
+        // stores no block size for it and the reader restores the uncompressed
+        // size (FPakEntry::Encode/Decode). UnrealPak takes this path for every
+        // file smaller than the Pak-wide block size; leaving the size at 0 makes
+        // the block layout undecodable. repak's own writer escapes unaligned
+        // sizes with 0x3f instead, so its Paks never hit this.
+        if compression.is_some() && compression_block_size == 0 && compression_block_count == 1 {
+            compression_block_size = u32::try_from(uncompressed)
+                .map_err(|_| {
+                    super::Error::Other("single compression block is too large".to_string())
+                })?;
+        }
 
         let offset_base = Entry::get_serialized_size(version, compression, compression_block_count);
 

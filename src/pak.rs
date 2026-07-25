@@ -3042,6 +3042,24 @@ fn parse_encoded_entry(bytes: &[u8], offset: usize, path: &str) -> Result<Encode
             "compressed file {path} declares no compression blocks"
         )));
     }
+    // UE stores 0 for a single-block compressed entry's block size because the
+    // block covers the whole file; the local file header still carries the real
+    // value. UnrealPak hits this for every file smaller than the Pak-wide block
+    // size, so without restoring it here `validate_local_entry_header` rejects
+    // the Pak as corrupt. Writers that always emit a Pak-wide, 2048-aligned
+    // block size (repak) encode it losslessly and are unaffected.
+    let compression_block_size = if compression_method != 0
+        && compression_block_size == 0
+        && block_count == 1
+    {
+        u32::try_from(uncompressed_size).map_err(|_| {
+            PakError::Corrupt(format!(
+                "single-block file {path} is {uncompressed_size} bytes, too large for one compression block"
+            ))
+        })?
+    } else {
+        compression_block_size
+    };
     let mut block_sizes = Vec::new();
     block_sizes
         .try_reserve_exact(block_count as usize)

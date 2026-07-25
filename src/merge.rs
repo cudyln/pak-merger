@@ -7948,28 +7948,19 @@ mod tests {
         assert!(conditions.len() <= 15);
         assert!(params.len() <= 15);
         assert_eq!(conditions.len(), params.len());
-        // TacticalActionList is an audited profile: keep every declared group
-        // present so this fixture exercises indexed condition coupling instead
-        // of the fail-closed whole-package fallback for an incomplete schema.
-        let mut row = vec![0xde, 0, 17];
+        // Real TacticalActionList schema: the index group plus the condition
+        // block, which on AIBattle has no `m_Equipment`. Every declared group of
+        // the `aibattle_tactical_action_list` rule is fully present, so this
+        // fixture exercises indexed condition coupling instead of the
+        // fail-closed whole-package fallback for an incomplete schema.
+        let mut row = vec![0xde, 0, 12];
         row.extend(fixstr("m_id"));
         row.push(id);
-        for field in [
-            "m_UseSkills",
-            "m_Tactics",
-            "m_TacticalList",
-            "m_SkillIndex",
-            "m_FriendlyIndex",
-        ] {
+        for field in ["m_TacticalList", "m_SkillIndex", "m_FriendlyIndex"] {
             row.extend(fixstr(field));
             row.push(0x90);
         }
-        for (field, value) in [
-            ("m_Presage", 0xc2),
-            ("m_PresageSkillID", 0),
-            ("m_OnEventFlgIndex", 0),
-            ("m_OffEventFlgIndex", 0),
-        ] {
+        for (field, value) in [("m_SelectType", 0), ("m_PrioritySkill", 0xc2)] {
             row.extend(fixstr(field));
             row.push(value);
         }
@@ -7984,7 +7975,6 @@ mod tests {
             "m_StatusTypes",
             "m_WeaponTypes",
             "m_MagicTypes",
-            "m_Equipment",
         ] {
             row.extend(fixstr(field));
             row.push(0x90 | zeros.len() as u8);
@@ -10864,12 +10854,15 @@ mod tests {
         let report = write(resolve(plan, resolutions).unwrap(), &output).unwrap();
         assert!(report.verification_passed);
         // Selecting one audited condition slot replaces that index across all
-        // seven coupled arrays, even though it is one logical atomic unit.
-        assert_eq!(report.raw_replaced_nodes, 7);
+        // six coupled arrays, even though it is one logical atomic unit.
+        // AIBattle carries no `m_Equipment`; only the Skill condition tables do.
+        assert_eq!(report.raw_replaced_nodes, 6);
         let audit = report.raw_preservation_audits.first().unwrap();
         assert_eq!(audit.verified_row_count, 1);
-        assert_eq!(audit.verified_atomic_unit_count, 7);
-        assert_eq!(audit.preserved_node_count, 6);
+        // m_id, the three-field index group, and the two coupled condition
+        // slots: five atomic units for the real TacticalActionList schema.
+        assert_eq!(audit.verified_atomic_unit_count, 5);
+        assert_eq!(audit.preserved_node_count, 4);
         assert_eq!(audit.replaced_node_count, 1);
         let archive = PakArchive::open(&output).unwrap();
         let merged = BinaryAsset::parse(&archive.read_entry(&uexp).unwrap()).unwrap();
