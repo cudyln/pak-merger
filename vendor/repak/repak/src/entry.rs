@@ -288,9 +288,8 @@ impl Entry {
         // rejects an entry that disagrees ("PakEntry mismatch"), so match the
         // engine here instead of carrying `layout.block_size` through.
         let entry_block_size = if block_count == 1 {
-            u32::try_from(total).map_err(|_| {
-                Error::Other("single compression block is too large".to_owned())
-            })?
+            u32::try_from(total)
+                .map_err(|_| Error::Other("single compression block is too large".to_owned()))?
         } else {
             layout.block_size
         };
@@ -527,10 +526,9 @@ impl Entry {
         // the block layout undecodable. repak's own writer escapes unaligned
         // sizes with 0x3f instead, so its Paks never hit this.
         if compression.is_some() && compression_block_size == 0 && compression_block_count == 1 {
-            compression_block_size = u32::try_from(uncompressed)
-                .map_err(|_| {
-                    super::Error::Other("single compression block is too large".to_string())
-                })?;
+            compression_block_size = u32::try_from(uncompressed).map_err(|_| {
+                super::Error::Other("single compression block is too large".to_string())
+            })?;
         }
 
         let offset_base = Entry::get_serialized_size(version, compression, compression_block_count);
