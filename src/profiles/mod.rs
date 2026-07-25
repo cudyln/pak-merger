@@ -312,6 +312,16 @@ pub struct ReferenceRule {
     pub source_table: &'static str,
     pub field: &'static str,
     pub target_table: &'static str,
+    /// `(source row, target id)` pairs that already point at nothing in the
+    /// shipped game data, so no merge can be blamed for them.
+    ///
+    /// A rule can be right about every row a mod would ever touch and still
+    /// meet one reference the developers left dangling. Reporting that on every
+    /// merge is a warning nobody can act on, and an unactionable warning is what
+    /// teaches people to skip the box that also holds the real breaks. Naming
+    /// the exact pair keeps both the rule and its coverage while staying
+    /// honest: anything not listed here is still reported.
+    pub vanilla_gaps: &'static [(i64, u64)],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

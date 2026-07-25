@@ -5551,7 +5551,12 @@ fn validate_known_references_in_archive(
             let present = i64::try_from(pending.target_id)
                 .ok()
                 .is_some_and(|id| targets.binary_search(&id).is_ok());
-            if !present {
+            // A pair that already dangles in the shipped game is not this
+            // merge's doing, so reporting it would be noise.
+            let vanilla_gap = rule
+                .vanilla_gaps
+                .contains(&(pending.source_row, pending.target_id));
+            if !present && !vanilla_gap {
                 missing_count = missing_count.saturating_add(1);
                 if missing_examples.len() < MAX_REFERENCE_BREAK_EXAMPLES {
                     missing_examples.insert(format!(
@@ -5622,7 +5627,13 @@ fn read_reference_table(
     parse_indexed_binary_asset_with_progress(bytes, cancelled, progress)
 }
 
-fn visit_positive_integer_leaves(
+/// Reads a field the way the reference check reads it: every strictly positive
+/// integer, arrays and nested maps flattened. Zero and negatives are the
+/// engine's "no reference" values.
+///
+/// `pub(crate)` so the profiles' real-data tests measure their rules through
+/// the same selector the check uses, rather than a second copy that could drift.
+pub(crate) fn visit_positive_integer_leaves(
     node: &binary_asset::MsgpackNode,
     visitor: &mut impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
@@ -8587,6 +8598,7 @@ mod tests {
             source_table: "EnemyGroupData",
             field: "Label",
             target_table: "EnemyDB",
+            vanilla_gaps: &[],
         }];
         profile
     }

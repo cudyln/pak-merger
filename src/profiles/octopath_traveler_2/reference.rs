@@ -485,6 +485,9 @@ pub(super) fn rules() -> Vec<ReferenceRule> {
         source_table,
         field,
         target_table,
+        // Every rule here resolves completely in the shipped game data, so
+        // there is nothing to exempt.
+        vanilla_gaps: &[],
     })
     .collect()
 }
