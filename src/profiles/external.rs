@@ -132,6 +132,11 @@ pub fn parse_external_profile_json(bytes: &[u8]) -> Result<GameProfile, ProfileL
             .into_iter()
             .map(ExternalAssetProfile::into_rule)
             .collect::<Result<Vec<_>, _>>()?,
+        // A declarative profile cannot carry reference rules: the schema has no
+        // field for them, and inventing one would let an external file drive a
+        // post-merge check whose failure the user cannot audit.
+        reference_tables: Vec::new(),
+        reference_rules: Vec::new(),
     };
     validate_game_profile(&profile)?;
     Ok(profile)

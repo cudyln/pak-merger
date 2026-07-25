@@ -21,6 +21,9 @@ pub mod datatable {
     pub struct TableSpec {
         pub rows: Vec<(&'static str, i32, &'static str)>,
         pub reference_import: Option<&'static str>,
+        /// When set, every row also carries a `Detail` `TextProperty` holding
+        /// this source string. Text is the shape most localisation mods edit.
+        pub text: Option<&'static str>,
     }
 
     impl TableSpec {
@@ -28,8 +31,34 @@ pub mod datatable {
             Self {
                 rows: rows.to_vec(),
                 reference_import: None,
+                text: None,
             }
         }
+
+        pub fn with_text(mut self, text: &'static str) -> Self {
+            self.text = Some(text);
+            self
+        }
+    }
+
+    /// Serialises an `FString` the way cooked data stores ASCII: length
+    /// including the NUL terminator, then the bytes.
+    fn fstring(text: &str) -> Vec<u8> {
+        let mut out = ((text.len() + 1) as i32).to_le_bytes().to_vec();
+        out.extend_from_slice(text.as_bytes());
+        out.push(0);
+        out
+    }
+
+    /// `FText` with a Base history: flags, history type 0, namespace, key,
+    /// source string.
+    fn ftext(source: &str) -> Vec<u8> {
+        let mut out = 0_u32.to_le_bytes().to_vec();
+        out.push(0);
+        out.extend_from_slice(&fstring(""));
+        out.extend_from_slice(&fstring("KEY"));
+        out.extend_from_slice(&fstring(source));
+        out
     }
 
     #[derive(Default)]
@@ -96,6 +125,9 @@ pub mod datatable {
             let mut label_value = label_index.to_le_bytes().to_vec();
             label_value.extend_from_slice(&0_i32.to_le_bytes());
             body.tag(&mut names, "Label", "NameProperty", &label_value);
+            if let Some(text) = spec.text {
+                body.tag(&mut names, "Detail", "TextProperty", &ftext(text));
+            }
             if position == 0 && spec.reference_import.is_some() {
                 // Package index -3: the optional third import.
                 body.tag(&mut names, "Ref", "ObjectProperty", &(-3_i32).to_le_bytes());

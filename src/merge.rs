@@ -28,7 +28,11 @@ const OUTPUT_COPY_BUFFER_BYTES: usize = 8 * 1024 * 1024;
 /// current slice, so concurrent updates cannot double-count completed work.
 const ANALYSIS_PROGRESS_STEPS_PER_UNIT: usize = ANALYSIS_PROGRESS_STEPS_PER_ITEM;
 const DATABASE_ANALYSIS_PHASE_COUNT: usize = 2;
-const OT0_PROFILE_ID: &str = "octopath_traveler_0";
+/// Shown when the pinned profile declares no cross-table reference rules. It
+/// is a routine notice, not a problem with the merge, and the GUI classifies it
+/// as such.
+pub const NO_REFERENCE_RULES_NOTICE: &str =
+    "This game has no cross-table reference rules, so that post-merge check was skipped.";
 type DatabaseIndexProgressCallback<'a> = dyn FnMut(u64, u64, &str) + 'a;
 type AnalysisUnitProgressCallback<'a> = dyn FnMut(AnalysisUnitProgress) + 'a;
 
@@ -138,97 +142,6 @@ struct OutputTargetStamp {
     modified: Option<SystemTime>,
     readonly: bool,
 }
-
-#[derive(Debug, Clone, Copy)]
-struct KnownReferenceRule {
-    source_table: &'static str,
-    field: &'static str,
-    target_table: &'static str,
-}
-
-// Reference checks run only when both complete tables are available.
-const KNOWN_REFERENCE_RULES: &[KnownReferenceRule] = &[
-    KnownReferenceRule {
-        source_table: "EnemyGroups",
-        field: "m_EnemyID",
-        target_table: "EnemyID",
-    },
-    KnownReferenceRule {
-        source_table: "EnemyID",
-        field: "m_TypeID",
-        target_table: "EnemyTypeID",
-    },
-    KnownReferenceRule {
-        source_table: "EnemyID",
-        field: "m_WeakID",
-        target_table: "EnemyWeakLockID",
-    },
-    KnownReferenceRule {
-        source_table: "EnemyID",
-        field: "m_ResistAilmentID",
-        target_table: "SkillResistAilmentID",
-    },
-    KnownReferenceRule {
-        source_table: "EnemyID",
-        field: "m_SkillsID",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_BoostSkills",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_ReplaceSkill",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_ReplaceSkillArray",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_WeaponReplaceSkill",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_Avails",
-        target_table: "SkillAvailID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_BeginEffective",
-        target_table: "SkillEffectiveID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_Effectives",
-        target_table: "SkillEffectiveID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillID",
-        field: "m_EndEffective",
-        target_table: "SkillEffectiveID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillAvailID",
-        field: "m_DelayedSkill",
-        target_table: "SkillID",
-    },
-    KnownReferenceRule {
-        source_table: "SkillAvailID",
-        field: "m_ResistAilmentID",
-        target_table: "SkillResistAilmentID",
-    },
-    KnownReferenceRule {
-        source_table: "BattleEventList",
-        field: "m_EventCommand",
-        target_table: "BattleEventCommand",
-    },
-];
 
 #[derive(Debug, thiserror::Error)]
 pub enum MergeError {
@@ -706,14 +619,13 @@ fn analyze_opened(
                 })
         })
         .collect::<Vec<_>>();
+    let pinned_declares_references = selected_profile_id
+        .as_deref()
+        .and_then(|id| profile_registry.game(id))
+        .is_some_and(|game| !game.reference_rules.is_empty());
     match profile_detection.status {
-        ProfileDetectionStatus::Selected
-            if selected_profile_id.as_deref() != Some(OT0_PROFILE_ID) =>
-        {
-            warnings.push(format!(
-                "Profile {} has no built-in reference checks.",
-                selected_profile_id.as_deref().unwrap_or("unknown")
-            ));
+        ProfileDetectionStatus::Selected if !pinned_declares_references => {
+            warnings.push(NO_REFERENCE_RULES_NOTICE.to_owned());
         }
         ProfileDetectionStatus::Selected => {}
         ProfileDetectionStatus::GenericNoMatch => {
@@ -1373,6 +1285,7 @@ where
     };
     let reference_validation_warnings = validate_references_for_pinned_profile(
         current_plan,
+        profile_registry,
         &verified_archive,
         cancelled,
         options.multithreaded,
@@ -5241,29 +5154,194 @@ fn verify_input_identities(opened: &[OpenedPak], descriptors: &[InputDescriptor]
     Ok(())
 }
 
+/// Runs the pinned profile's reference rules, if it declares any.
+///
+/// Gating on declared rules rather than on a profile id keeps this honest as
+/// profiles are added: a profile without reference knowledge reports that it
+/// has none instead of naming a different game.
 fn validate_references_for_pinned_profile(
     plan: &MergePlan,
+    profile_registry: &profiles::ProfileRegistry,
     archive: &PakArchive,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
     progress: &mut dyn FnMut(u64, u64, Option<String>),
 ) -> Result<Vec<String>> {
-    if pinned_profile_id(plan) == Some(OT0_PROFILE_ID) {
-        return validate_known_references_in_archive(archive, cancelled, multithreaded, progress);
+    let profile = pinned_profile_id(plan).and_then(|id| profile_registry.game(id));
+    match profile {
+        Some(profile) if !profile.reference_rules.is_empty() => match profile.format {
+            profiles::ProfileFormat::MessagePackMDataListV1 => {
+                validate_known_references_in_archive(
+                    profile,
+                    archive,
+                    cancelled,
+                    multithreaded,
+                    progress,
+                )
+            }
+            profiles::ProfileFormat::Ue4DataTableV1 => {
+                validate_data_table_references_in_archive(profile, archive, cancelled, progress)
+            }
+        },
+        _ => {
+            progress(1, 1, None);
+            Ok(vec![NO_REFERENCE_RULES_NOTICE.to_owned()])
+        }
     }
-    progress(1, 1, None);
-    Ok(vec![
-        "Reference checks require the OCTOPATH TRAVELER 0 profile.".to_owned(),
-    ])
 }
 
 #[cfg(test)]
 fn validate_known_references(path: &Path) -> Result<Vec<String>> {
     let archive = PakArchive::open(path)?;
-    validate_known_references_in_archive(&archive, None, true, &mut |_, _, _| {})
+    let registry = profiles::ProfileRegistry::with_builtins();
+    let profile = registry
+        .game("octopath_traveler_0")
+        .expect("built-in OT0 profile");
+    validate_known_references_in_archive(profile, &archive, None, true, &mut |_, _, _| {})
+}
+
+/// Post-merge reference check for `UDataTable` databases.
+///
+/// The `UDataTable` counterpart of `validate_known_references_in_archive`. Rows
+/// are keyed by name rather than by integer id, so a reference is a field whose
+/// value must be a row name of the target table.
+///
+/// Only rules whose source and target tables are BOTH present in the merged Pak
+/// run: a Pak that ships one side alone says nothing about the other, and
+/// checking against a table the user never merged would invent breaks.
+fn validate_data_table_references_in_archive(
+    profile: &profiles::GameProfile,
+    archive: &PakArchive,
+    cancelled: Option<&CancellationToken>,
+    progress: &mut dyn FnMut(u64, u64, Option<String>),
+) -> Result<Vec<String>> {
+    let inventory = archive.inventory();
+    let grouping = pak::group_packages(inventory.entries.iter().map(|entry| entry.path.as_str()))?;
+
+    let mut table_groups: BTreeMap<&'static str, &pak::PackageGroup> = BTreeMap::new();
+    for group in &grouping.packages {
+        if !group.complete {
+            continue;
+        }
+        let Some(table) = profile.reference_table(&group.base_path) else {
+            continue;
+        };
+        if let Some(previous) = table_groups.insert(table, group) {
+            return Err(MergeError::Verification(format!(
+                "Reference checking cannot continue because table {table} appears in two places: {} and {}",
+                previous.base_path, group.base_path
+            )));
+        }
+    }
+
+    let active: Vec<&profiles::ReferenceRule> = profile
+        .reference_rules
+        .iter()
+        .filter(|rule| {
+            table_groups.contains_key(rule.source_table)
+                && table_groups.contains_key(rule.target_table)
+        })
+        .collect();
+    if active.is_empty() {
+        progress(1, 1, None);
+        return Ok(vec![
+            "No reference rule had both of its tables in the merged Pak, so none were checked."
+                .to_owned(),
+        ]);
+    }
+
+    // Load each table once. Only the tables an active rule names are read.
+    let needed: BTreeSet<&'static str> = active
+        .iter()
+        .flat_map(|rule| [rule.source_table, rule.target_table])
+        .collect();
+    let total = needed.len() as u64;
+    let mut images: BTreeMap<&'static str, data_table_merge::DataTableImage> = BTreeMap::new();
+    for (index, table) in needed.iter().enumerate() {
+        check_cancel(cancelled)?;
+        let group = table_groups[table];
+        progress(index as u64, total, Some(group.base_path.clone()));
+        let uasset = group
+            .components
+            .get(&PackageComponent::Uasset)
+            .ok_or_else(|| missing_package_component(group, PackageComponent::Uasset))?;
+        let uexp = group
+            .components
+            .get(&PackageComponent::Uexp)
+            .ok_or_else(|| missing_package_component(group, PackageComponent::Uexp))?;
+        let image = data_table_merge::DataTableImage::parse(
+            archive.read_entry(uasset)?,
+            archive.read_entry(uexp)?,
+        )
+        .map_err(|error| {
+            MergeError::Verification(format!(
+                "{}: the merged table could not be read back for reference checking: {error}",
+                group.base_path
+            ))
+        })?;
+        images.insert(table, image);
+    }
+    progress(total, total, None);
+
+    let mut warnings = Vec::new();
+    let mut breaks = 0_usize;
+    let mut examples: Vec<String> = Vec::new();
+    for rule in &active {
+        check_cancel(cancelled)?;
+        let source = &images[rule.source_table];
+        let known: BTreeSet<&str> = images[rule.target_table]
+            .index
+            .rows
+            .iter()
+            .map(|row| row.name.as_ref())
+            .collect();
+        for row_index in 0..source.index.rows.len() {
+            let layout = source.row_layout(row_index).map_err(|error| {
+                MergeError::Verification(format!("{}: {error}", source.index.rows[row_index].name))
+            })?;
+            let Some(field) = layout.field(rule.field) else {
+                continue;
+            };
+            for value in field.referenced_names(source.body(), &source.package.names) {
+                if value.is_empty() || value == "None" || known.contains(value.as_str()) {
+                    continue;
+                }
+                breaks += 1;
+                if examples.len() < MAX_REFERENCE_BREAK_EXAMPLES {
+                    examples.push(format!(
+                        "{}.{} in row {} points at {} {value}, which the merged Pak does not contain",
+                        rule.source_table,
+                        crate::data_table_merge::demangle_property_name(rule.field),
+                        source.index.rows[row_index].name,
+                        rule.target_table,
+                    ));
+                }
+            }
+        }
+    }
+
+    if breaks == 0 {
+        warnings.push(format!(
+            "Known-reference validation checked {} rules and found no broken references.",
+            active.len()
+        ));
+    } else {
+        warnings.push(format!(
+            "REFERENCE_BREAK: {breaks} reference(s) point at rows the merged Pak does not contain."
+        ));
+        warnings.extend(examples);
+    }
+    let skipped = profile.reference_rules.len() - active.len();
+    if skipped != 0 {
+        warnings.push(format!(
+            "{skipped} reference rule(s) were skipped because only one of their two tables is in the merged Pak."
+        ));
+    }
+    Ok(warnings)
 }
 
 fn validate_known_references_in_archive(
+    profile: &profiles::GameProfile,
     archive: &PakArchive,
     cancelled: Option<&CancellationToken>,
     multithreaded: bool,
@@ -5271,7 +5349,7 @@ fn validate_known_references_in_archive(
 ) -> Result<Vec<String>> {
     let mut table_groups = BTreeMap::<&'static str, pak::PackageGroup>::new();
     for group in &archive.inventory().packages.packages {
-        let Some(table) = known_reference_table(&group.base_path) else {
+        let Some(table) = profile.reference_table(&group.base_path) else {
             continue;
         };
         if let Some(previous) = table_groups.insert(table, group.clone()) {
@@ -5353,7 +5431,7 @@ fn validate_known_references_in_archive(
                     let row = indexed_row_at(&asset, row_index, cancelled)?
                         .expect("indexed reference row remains available");
                     ids.push(row.id);
-                    for (rule_index, rule) in KNOWN_REFERENCE_RULES.iter().enumerate() {
+                    for (rule_index, rule) in profile.reference_rules.iter().enumerate() {
                         if rule.source_table != table {
                             continue;
                         }
@@ -5412,7 +5490,8 @@ fn validate_known_references_in_archive(
     let mut missing_examples = BTreeSet::new();
     let mut active_rule_indices = BTreeSet::new();
 
-    let source_tables: BTreeSet<_> = KNOWN_REFERENCE_RULES
+    let source_tables: BTreeSet<_> = profile
+        .reference_rules
         .iter()
         .map(|rule| rule.source_table)
         .collect();
@@ -5426,7 +5505,8 @@ fn validate_known_references_in_archive(
         }
 
         let mut source_has_active_rule = false;
-        for (rule_index, rule) in KNOWN_REFERENCE_RULES
+        for (rule_index, rule) in profile
+            .reference_rules
             .iter()
             .enumerate()
             .filter(|(_, rule)| rule.source_table == source_table)
@@ -5464,7 +5544,7 @@ fn validate_known_references_in_archive(
         check_cancel(cancelled)?;
         if !active_rule_indices.contains(&pending.rule_index) {
         } else {
-            let rule = &KNOWN_REFERENCE_RULES[pending.rule_index];
+            let rule = &profile.reference_rules[pending.rule_index];
             let targets = row_ids
                 .get(rule.target_table)
                 .expect("active reference rule has compact target IDs");
@@ -5515,31 +5595,6 @@ fn validate_known_references_in_archive(
     warnings.sort();
     warnings.dedup();
     Ok(warnings)
-}
-
-fn known_reference_table(base_path: &str) -> Option<&'static str> {
-    let path = sort_key(base_path);
-    const TABLES: &[(&str, &str)] = &[
-        ("/local/database/enemy/enemygroups", "EnemyGroups"),
-        ("/local/database/enemy/enemyid", "EnemyID"),
-        ("/local/database/enemy/enemytypeid", "EnemyTypeID"),
-        ("/local/database/enemy/enemyweaklockid", "EnemyWeakLockID"),
-        ("/local/database/skill/skillid", "SkillID"),
-        ("/local/database/skill/skillavailid", "SkillAvailID"),
-        ("/local/database/skill/skilleffectiveid", "SkillEffectiveID"),
-        (
-            "/local/database/skill/skillresistailmentid",
-            "SkillResistAilmentID",
-        ),
-        ("/local/database/battle/battleeventlist", "BattleEventList"),
-        (
-            "/local/database/battle/battleeventcommand",
-            "BattleEventCommand",
-        ),
-    ];
-    TABLES
-        .iter()
-        .find_map(|(suffix, table)| path.ends_with(suffix).then_some(*table))
 }
 
 fn read_reference_table(
@@ -8089,7 +8144,10 @@ mod tests {
             carrier_path: first,
         };
         let plan = analyze(request.clone()).unwrap();
-        assert_eq!(plan.selected_profile_id.as_deref(), Some(OT0_PROFILE_ID));
+        assert_eq!(
+            plan.selected_profile_id.as_deref(),
+            Some("octopath_traveler_0")
+        );
         assert_eq!(
             plan.profile_detection_status,
             Some(ProfileDetectionStatus::Selected)
@@ -8149,11 +8207,21 @@ mod tests {
         );
 
         let archive = PakArchive::open(&first).unwrap();
-        let reference_warnings =
-            validate_references_for_pinned_profile(&plan, &archive, None, true, &mut |_, _, _| {})
-                .unwrap();
-        assert_eq!(reference_warnings.len(), 1);
-        assert!(reference_warnings[0].contains("require the OCTOPATH TRAVELER 0 profile"));
+        let reference_warnings = validate_references_for_pinned_profile(
+            &plan,
+            profiles::default_registry(),
+            &archive,
+            None,
+            true,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+        // A profile that declares no reference rules says exactly that, rather
+        // than naming a different game.
+        assert_eq!(
+            reference_warnings,
+            vec![NO_REFERENCE_RULES_NOTICE.to_owned()]
+        );
     }
 
     #[test]
@@ -8462,6 +8530,168 @@ mod tests {
             .expect("label resolves")
             .to_owned();
         (amount, label)
+    }
+
+    /// Builds a Pak holding a source table and the table it points at.
+    ///
+    /// `Label` stands in for a real reference field so the check can be
+    /// exercised without shipping game data: the profile below points a rule at
+    /// it, and `targets` decides which of those labels actually exist.
+    fn write_ot2_reference_pak(path: &Path, labels: &[&'static str], targets: &[&'static str]) {
+        use crate::testing::datatable::{TableSpec, build_table};
+        let source_rows: Vec<(&'static str, i32, &'static str)> = labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (SOURCE_ROWS[index], index as i32, *label))
+            .collect();
+        let target_rows: Vec<(&'static str, i32, &'static str)> = targets
+            .iter()
+            .map(|name| (*name, 0_i32, "Unused"))
+            .collect();
+        let (source_uasset, source_uexp) = build_table(&TableSpec::new(&source_rows));
+        let (target_uasset, target_uexp) = build_table(&TableSpec::new(&target_rows));
+        write_versioned_test_pak(
+            path,
+            repak::Version::V11,
+            "../../../Octopath_Traveler2/Content/",
+            [
+                (format!("{OT2_TABLE}.uasset"), source_uasset),
+                (format!("{OT2_TABLE}.uexp"), source_uexp),
+                (format!("{OT2_TARGET_TABLE}.uasset"), target_uasset),
+                (format!("{OT2_TARGET_TABLE}.uexp"), target_uexp),
+            ],
+        );
+    }
+
+    const OT2_TARGET_TABLE: &str = "Character/Database/EnemyDB";
+    const SOURCE_ROWS: [&str; 3] = ["GRP_001", "GRP_002", "GRP_003"];
+
+    /// The shipped OT2 profile with one rule aimed at the synthetic `Label`
+    /// field, so the check can be tested without shipping game data.
+    fn ot2_profile_with_label_rule() -> profiles::GameProfile {
+        let mut profile = profiles::default_registry()
+            .game("octopath_traveler_2")
+            .expect("the OT2 profile is built in")
+            .clone();
+        profile.reference_tables = vec![
+            profiles::ReferenceTable {
+                path_suffix: "/battle/database/enemygroupdata",
+                name: "EnemyGroupData",
+            },
+            profiles::ReferenceTable {
+                path_suffix: "/character/database/enemydb",
+                name: "EnemyDB",
+            },
+        ];
+        profile.reference_rules = vec![profiles::ReferenceRule {
+            source_table: "EnemyGroupData",
+            field: "Label",
+            target_table: "EnemyDB",
+        }];
+        profile
+    }
+
+    #[test]
+    fn a_data_table_reference_to_a_missing_row_is_reported() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Broken_P.pak");
+        // GRP_003 points at ENE_003, which the target table does not define.
+        write_ot2_reference_pak(
+            &path,
+            &["ENE_001", "ENE_002", "ENE_003"],
+            &["ENE_001", "ENE_002"],
+        );
+
+        let archive = PakArchive::open(&path).unwrap();
+        let warnings = validate_data_table_references_in_archive(
+            &ot2_profile_with_label_rule(),
+            &archive,
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.starts_with("REFERENCE_BREAK: 1 ")),
+            "the break should be counted: {warnings:#?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("GRP_003") && line.contains("ENE_003")),
+            "the example should name the row and what it points at: {warnings:#?}"
+        );
+        assert!(
+            !warnings.iter().any(|line| line.contains("ENE_001")),
+            "references that resolve must not be reported: {warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn data_table_references_that_all_resolve_report_no_break() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("Intact_P.pak");
+        write_ot2_reference_pak(
+            &path,
+            &["ENE_001", "ENE_002", "ENE_003"],
+            &["ENE_001", "ENE_002", "ENE_003"],
+        );
+
+        let archive = PakArchive::open(&path).unwrap();
+        let warnings = validate_data_table_references_in_archive(
+            &ot2_profile_with_label_rule(),
+            &archive,
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(
+            !warnings.iter().any(|line| line.contains("REFERENCE_BREAK")),
+            "intact data must not be reported as broken: {warnings:#?}"
+        );
+    }
+
+    /// A rule whose target table is absent has to stay quiet. A Pak that ships
+    /// one side of a reference says nothing about the other, so checking it
+    /// against a table the user never merged would invent breaks.
+    #[test]
+    fn a_rule_whose_target_table_is_absent_is_skipped_not_reported() {
+        use crate::testing::datatable::{TableSpec, build_table};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("SourceOnly_P.pak");
+        let (uasset, uexp) = build_table(&TableSpec::new(&[("GRP_001", 0, "ENE_404")]));
+        write_versioned_test_pak(
+            &path,
+            repak::Version::V11,
+            "../../../Octopath_Traveler2/Content/",
+            [
+                (format!("{OT2_TABLE}.uasset"), uasset),
+                (format!("{OT2_TABLE}.uexp"), uexp),
+            ],
+        );
+
+        let archive = PakArchive::open(&path).unwrap();
+        let warnings = validate_data_table_references_in_archive(
+            &ot2_profile_with_label_rule(),
+            &archive,
+            None,
+            &mut |_, _, _| {},
+        )
+        .unwrap();
+
+        assert!(
+            !warnings.iter().any(|line| line.contains("REFERENCE_BREAK")),
+            "a half-present rule must not be reported as broken: {warnings:#?}"
+        );
+        assert!(
+            warnings
+                .iter()
+                .any(|line| line.contains("none were checked")),
+            "the skip should be stated: {warnings:#?}"
+        );
     }
 
     #[test]
@@ -9099,7 +9329,10 @@ mod tests {
         })
         .unwrap();
 
-        assert_eq!(plan.selected_profile_id.as_deref(), Some(OT0_PROFILE_ID));
+        assert_eq!(
+            plan.selected_profile_id.as_deref(),
+            Some("octopath_traveler_0")
+        );
         assert_eq!(
             plan.assets
                 .iter()

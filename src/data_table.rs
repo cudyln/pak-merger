@@ -121,10 +121,20 @@ fn fixed_value_size(property_type: &str) -> Option<usize> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RowField {
     pub name: String,
+    /// Serialised property type, e.g. `IntProperty`.
+    pub property_type: String,
     /// Tag header plus value. Replacing exactly this range replaces the field.
     pub range: Range<usize>,
-    /// Absolute offsets of `FName` references within `range`.
+    /// The value alone, without the tag header.
+    pub value_range: Range<usize>,
+    /// A `BoolProperty` keeps its value in the tag rather than the value bytes.
+    pub bool_value: Option<bool>,
+    /// Absolute offsets of every `FName` within `range`, tag headers included.
+    /// A retarget has to rewrite all of them.
     pub fname_sites: Vec<usize>,
+    /// The subset of `fname_sites` holding property VALUES, so the only ones
+    /// that can name a row of another table.
+    pub value_fname_sites: Vec<usize>,
     /// Absolute offsets of `FPackageIndex` values within `range`. A field with
     /// any of these can only be spliced when both packages resolve them
     /// identically.
@@ -136,6 +146,193 @@ impl RowField {
     /// `FName` references, so a retarget is all a splice needs.
     pub fn is_name_retargetable(&self) -> bool {
         self.package_index_sites.is_empty()
+    }
+
+    /// Every row name this field could be referencing.
+    ///
+    /// Only value `FName`s count. An array or struct carries its own property
+    /// tags *inside* the parent's value bytes, so taking every `FName` in the
+    /// value range would also collect nested property names and type names and
+    /// then report them as references to rows that do not exist.
+    pub fn referenced_names(&self, body: &[u8], names: &[NameEntry]) -> Vec<String> {
+        self.value_fname_sites
+            .iter()
+            .filter_map(|site| body.get(*site..*site + FNAME_SIZE))
+            .map(|raw| render_fname(raw, names))
+            // Three kinds of value are not row names: `None` is Unreal's empty
+            // reference, a value holding `::` is an enum literal such as
+            // `EAILMENT_TYPE::NewEnumerator0`, and one starting with `/` is an
+            // asset path from a soft object reference. The measurements that
+            // established these rules excluded all three, so the check has to
+            // exclude them too or it would report breaks the measurement never
+            // saw.
+            .filter(|value| {
+                !value.is_empty()
+                    && value != NONE
+                    && !value.contains("::")
+                    && !value.starts_with('/')
+            })
+            .collect()
+    }
+
+    /// The value rendered for a human choosing between two Paks.
+    ///
+    /// This must show the VALUE, never the tag header: the header begins with
+    /// the property-name `FName`, which is identical for every row, so showing
+    /// it would make every variant look the same and leave the user unable to
+    /// tell the two Paks apart.
+    pub fn preview(&self, body: &[u8], names: &[NameEntry]) -> String {
+        const MAX: usize = 60;
+        let value = body.get(self.value_range.clone()).unwrap_or_default();
+        let rendered = match self.property_type.as_str() {
+            "BoolProperty" => match self.bool_value {
+                Some(true) => "true".to_owned(),
+                Some(false) => "false".to_owned(),
+                None => "?".to_owned(),
+            },
+            "Int8Property" => render_int(value, 1, true),
+            "Int16Property" => render_int(value, 2, true),
+            "UInt16Property" => render_int(value, 2, false),
+            "IntProperty" => render_int(value, 4, true),
+            "UInt32Property" => render_int(value, 4, false),
+            "Int64Property" => render_int(value, 8, true),
+            "UInt64Property" => render_int(value, 8, false),
+            "FloatProperty" => value
+                .get(..4)
+                .map(|raw| f32::from_le_bytes(raw.try_into().expect("checked")).to_string())
+                .unwrap_or_default(),
+            "DoubleProperty" => value
+                .get(..8)
+                .map(|raw| f64::from_le_bytes(raw.try_into().expect("checked")).to_string())
+                .unwrap_or_default(),
+            "NameProperty" | "EnumProperty" => render_fname(value, names),
+            "ByteProperty" => {
+                if value.len() == FNAME_SIZE {
+                    render_fname(value, names)
+                } else {
+                    render_int(value, 1, false)
+                }
+            }
+            "StrProperty" => render_fstring(value).0,
+            "TextProperty" => render_ftext(value),
+            "SoftObjectProperty" | "SoftClassProperty" | "AssetObjectProperty" => {
+                let asset = render_fname(value, names);
+                let (sub, _) = render_fstring(value.get(FNAME_SIZE..).unwrap_or_default());
+                if sub.is_empty() {
+                    asset
+                } else {
+                    format!("{asset}.{sub}")
+                }
+            }
+            "ObjectProperty" | "ClassProperty" | "InterfaceProperty" | "LazyObjectProperty" => {
+                format!("reference {}", render_int(value, 4, true))
+            }
+            "ArrayProperty" | "SetProperty" | "MapProperty" => {
+                format!("{} entries", render_int(value, 4, true))
+            }
+            "StructProperty" => format!("{} bytes", value.len()),
+            other => format!("{other} ({} bytes)", value.len()),
+        };
+        truncate_display(&rendered, MAX)
+    }
+}
+
+fn truncate_display(text: &str, max: usize) -> String {
+    let cleaned: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    if cleaned.chars().count() <= max {
+        return cleaned;
+    }
+    cleaned.chars().take(max).collect::<String>() + "…"
+}
+
+fn render_int(value: &[u8], width: usize, signed: bool) -> String {
+    let Some(raw) = value.get(..width) else {
+        return String::new();
+    };
+    let mut buffer = [0_u8; 8];
+    buffer[..width].copy_from_slice(raw);
+    let unsigned = u64::from_le_bytes(buffer);
+    if !signed {
+        return unsigned.to_string();
+    }
+    let shift = 64 - width * 8;
+    (((unsigned << shift) as i64) >> shift).to_string()
+}
+
+fn render_fname(value: &[u8], names: &[NameEntry]) -> String {
+    let Some(raw) = value.get(..FNAME_SIZE) else {
+        return String::new();
+    };
+    let index = i32::from_le_bytes(raw[..4].try_into().expect("checked"));
+    let number = i32::from_le_bytes(raw[4..8].try_into().expect("checked"));
+    let text = usize::try_from(index)
+        .ok()
+        .and_then(|index| names.get(index))
+        .map_or("<unknown>", |entry| entry.text.as_str());
+    if number <= 0 {
+        text.to_owned()
+    } else {
+        format!("{text}_{}", number - 1)
+    }
+}
+
+/// Decodes an `FString` and reports how many bytes it occupied.
+fn render_fstring(value: &[u8]) -> (String, usize) {
+    let Some(raw) = value.get(..4) else {
+        return (String::new(), 0);
+    };
+    let length = i32::from_le_bytes(raw.try_into().expect("checked"));
+    if length == 0 {
+        return (String::new(), 4);
+    }
+    if length > 0 {
+        let count = length as usize;
+        let Some(bytes) = value.get(4..4 + count) else {
+            return (String::new(), 4);
+        };
+        let text = String::from_utf8_lossy(bytes.strip_suffix(b"\0").unwrap_or(bytes));
+        return (text.into_owned(), 4 + count);
+    }
+    let units = length.unsigned_abs() as usize;
+    let Some(bytes) = value.get(4..4 + units * 2) else {
+        return (String::new(), 4);
+    };
+    let utf16: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&utf16);
+    (text.trim_end_matches('\0').to_owned(), 4 + units * 2)
+}
+
+/// `FText`: flags, history type, then history-specific strings. The source
+/// string is what a human recognises, so that is what is shown.
+fn render_ftext(value: &[u8]) -> String {
+    let Some(history) = value.get(4).map(|byte| *byte as i8) else {
+        return String::new();
+    };
+    let rest = value.get(5..).unwrap_or_default();
+    match history {
+        -1 => {
+            let has = rest
+                .get(..4)
+                .map(|raw| i32::from_le_bytes(raw.try_into().expect("checked")))
+                .unwrap_or(0);
+            if has == 0 {
+                return "(empty)".to_owned();
+            }
+            render_fstring(rest.get(4..).unwrap_or_default()).0
+        }
+        0 => {
+            // namespace, key, then the source string.
+            let (_, used) = render_fstring(rest);
+            let (_, used_key) = render_fstring(rest.get(used..).unwrap_or_default());
+            render_fstring(rest.get(used + used_key..).unwrap_or_default()).0
+        }
+        other => format!("(text history {other})"),
     }
 }
 
@@ -296,8 +493,12 @@ impl DataTableIndex {
             }
             fields.push(RowField {
                 name: tag.name,
+                property_type: tag.property_type,
                 range: tag.range,
+                value_range: tag.value_range,
+                bool_value: tag.bool_value,
                 fname_sites: tag.fname_sites,
+                value_fname_sites: tag.value_fname_sites,
                 package_index_sites: tag.package_index_sites,
             });
         }
@@ -326,9 +527,13 @@ impl DataTableIndex {
 
 struct TagSpan {
     name: String,
+    property_type: String,
     /// Tag header plus value bytes.
     range: Range<usize>,
+    value_range: Range<usize>,
+    bool_value: Option<bool>,
     fname_sites: Vec<usize>,
+    value_fname_sites: Vec<usize>,
     package_index_sites: Vec<usize>,
 }
 
@@ -337,6 +542,10 @@ struct Walker<'a> {
     names: &'a [NameEntry],
     offset: usize,
     fname_sites: Vec<usize>,
+    /// The `fname_sites` entries that are property values rather than tag
+    /// metadata. Kept apart so a reference check can tell a value that names a
+    /// row from a nested property name that names nothing.
+    value_fname_sites: Vec<usize>,
     package_index_sites: Vec<usize>,
     depth: usize,
     /// Set while walking row data. The object-level block legitimately holds a
@@ -352,6 +561,7 @@ impl<'a> Walker<'a> {
             names,
             offset: 0,
             fname_sites: Vec::new(),
+            value_fname_sites: Vec::new(),
             package_index_sites: Vec::new(),
             depth: 0,
             in_row: false,
@@ -385,8 +595,18 @@ impl<'a> Walker<'a> {
         Ok(())
     }
 
-    /// Reads an `FName` and records its position for later retargeting.
+    /// Reads an `FName` that belongs to a property tag — a property name, a
+    /// type name, a struct name. Retargeted like any other, never a reference.
     fn fname(&mut self, field: &'static str) -> Result<String> {
+        self.read_fname(field, false)
+    }
+
+    /// Reads an `FName` that is a property VALUE, and so may name a row.
+    fn value_fname(&mut self, field: &'static str) -> Result<String> {
+        self.read_fname(field, true)
+    }
+
+    fn read_fname(&mut self, field: &'static str, is_value: bool) -> Result<String> {
         let site = self.offset;
         let index = self.i32(field)?;
         let number = self.i32(field)?;
@@ -403,6 +623,9 @@ impl<'a> Walker<'a> {
             _ => return Err(DataTableError::UnknownName { index: number }),
         };
         self.fname_sites.push(site);
+        if is_value {
+            self.value_fname_sites.push(site);
+        }
         Ok(match suffix {
             None => entry.text.clone(),
             Some(suffix) => format!("{}_{suffix}", entry.text),
@@ -434,6 +657,7 @@ impl<'a> Walker<'a> {
         loop {
             let tag_start = self.offset;
             let sites_before = self.fname_sites.len();
+            let value_sites_before = self.value_fname_sites.len();
             let indices_before = self.package_index_sites.len();
             let Some(tag) = self.read_tag(context)? else {
                 return Ok(spans);
@@ -455,8 +679,12 @@ impl<'a> Walker<'a> {
             self.offset = end;
             spans.push(TagSpan {
                 name: tag.name,
+                property_type: tag.property_type,
                 range: tag_start..end,
+                value_range: value_start..end,
+                bool_value: tag.bool_value,
                 fname_sites: self.fname_sites[sites_before..].to_vec(),
+                value_fname_sites: self.value_fname_sites[value_sites_before..].to_vec(),
                 package_index_sites: self.package_index_sites[indices_before..].to_vec(),
             });
         }
@@ -478,12 +706,24 @@ impl<'a> Walker<'a> {
         }
         let _array_index = self.i32("property array index")?;
         let mut extra = TagExtra::default();
+        let mut bool_value = None;
         match property_type.as_str() {
             "StructProperty" => {
                 extra.struct_name = Some(self.fname("struct name")?);
                 self.skip(16, "struct guid")?;
             }
-            "BoolProperty" => self.skip(1, "bool value")?,
+            "BoolProperty" => {
+                bool_value = Some(
+                    *self
+                        .bytes
+                        .get(self.offset)
+                        .ok_or(DataTableError::UnexpectedEnd {
+                            field: "bool value",
+                        })?
+                        != 0,
+                );
+                self.skip(1, "bool value")?;
+            }
             "ByteProperty" | "EnumProperty" => {
                 extra.enum_name = Some(self.fname("enum name")?);
             }
@@ -511,6 +751,7 @@ impl<'a> Walker<'a> {
             property_type,
             size,
             extra,
+            bool_value,
         }))
     }
 
@@ -555,14 +796,14 @@ impl<'a> Walker<'a> {
             // A byte property is an FName when the tag says 8 bytes.
             "ByteProperty" => {
                 if declared == Some(FNAME_SIZE as i32) {
-                    self.fname("byte enum value")?;
+                    self.value_fname("byte enum value")?;
                 } else {
                     self.skip(usize::try_from(declared.unwrap_or(1)).unwrap_or(1), "byte")?;
                 }
                 Ok(self.offset)
             }
             "NameProperty" | "EnumProperty" => {
-                self.fname("name value")?;
+                self.value_fname("name value")?;
                 Ok(self.offset)
             }
             "StrProperty" => {
@@ -571,7 +812,7 @@ impl<'a> Walker<'a> {
             }
             "TextProperty" => self.text_value(declared),
             "SoftObjectProperty" | "SoftClassProperty" | "AssetObjectProperty" => {
-                self.fname("soft object path")?;
+                self.value_fname("soft object path")?;
                 self.fstring("soft object sub path")?;
                 Ok(self.offset)
             }
@@ -628,7 +869,7 @@ impl<'a> Walker<'a> {
         let name = struct_name.unwrap_or_default();
         if is_soft_path_struct(name) {
             let start = self.offset;
-            self.fname("soft path asset name")?;
+            self.value_fname("soft path asset name")?;
             self.fstring("soft path sub path")?;
             self.check_declared("soft path struct", start, declared)?;
             return Ok(self.offset);
@@ -809,6 +1050,7 @@ struct PropertyTag {
     property_type: String,
     size: i32,
     extra: TagExtra,
+    bool_value: Option<bool>,
 }
 
 #[cfg(test)]

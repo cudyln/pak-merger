@@ -33,6 +33,8 @@
 //! the same enemy will conflict as one whole-field unit. That is a documented
 //! limitation rather than a silent one.
 
+mod reference;
+
 use super::{
     AssetProfile, AssetProfileRule, AtomicGroupRule, GameProfile, PathMatchKind, PathMatcher,
     ProfileFormat, ProfileOrigin, ProfilePrecision,
@@ -59,6 +61,8 @@ pub(super) fn game_profile() -> GameProfile {
             "/octopath_traveler2/content/",
         )],
         assets: asset_rules(),
+        reference_tables: reference::tables(),
+        reference_rules: reference::rules(),
     }
 }
 

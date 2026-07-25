@@ -173,8 +173,14 @@ impl DataTableImage {
     }
 
     /// Short human-readable summary of a unit, for the conflict picker.
+    ///
+    /// Renders the decoded VALUE of each field. An earlier version hex-dumped
+    /// the head of the field's bytes, which is the tag header — every variant
+    /// then previewed as the property name, so two Paks looked identical even
+    /// when their values differed.
     pub fn unit_preview(&self, layout: &RowLayout, fields: &[String]) -> String {
-        const MAX_PREVIEW: usize = 96;
+        const MAX_PREVIEW: usize = 120;
+        let body = self.body();
         let mut preview = String::new();
         for name in fields {
             let Some(field) = layout.field(name) else {
@@ -183,14 +189,13 @@ impl DataTableImage {
             if !preview.is_empty() {
                 preview.push_str(", ");
             }
-            let short = name.split('_').next().unwrap_or(name);
-            let bytes = self.normalized_field_bytes(field).unwrap_or_default();
-            preview.push_str(short);
-            preview.push('=');
-            preview.push_str(&hex::encode(&bytes[..bytes.len().min(8)]));
-            if preview.len() >= MAX_PREVIEW {
-                preview.truncate(MAX_PREVIEW);
-                preview.push('…');
+            if fields.len() > 1 {
+                preview.push_str(demangle_property_name(name));
+                preview.push('=');
+            }
+            preview.push_str(&field.preview(body, &self.package.names));
+            if preview.chars().count() >= MAX_PREVIEW {
+                preview = preview.chars().take(MAX_PREVIEW).collect::<String>() + "…";
                 break;
             }
         }
@@ -325,6 +330,24 @@ impl<'a> NameTableBuilder<'a> {
         self.appended.push(entry);
         self.lookup.insert(text.to_owned(), merged_index);
         merged_index
+    }
+}
+
+/// Strips the `_<index>_<32 hex GUID>` suffix Unreal appends to
+/// `UserDefinedStruct` members, so a preview reads `BGMID` rather than
+/// `BGMID_7_B47857404179EE90049AD8A2FCC54983`.
+pub fn demangle_property_name(name: &str) -> &str {
+    let Some((head, guid)) = name.rsplit_once('_') else {
+        return name;
+    };
+    if guid.len() != 32 || !guid.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return name;
+    }
+    match head.rsplit_once('_') {
+        Some((base, index)) if !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()) => {
+            base
+        }
+        _ => name,
     }
 }
 
@@ -621,6 +644,139 @@ mod tests {
 
     fn base() -> TableSpec {
         TableSpec::new(&[("ROW_A", 1, "Alpha"), ("ROW_B", 2, "Beta")])
+    }
+
+    /// Renders previews from a real cooked table. Ignored by default because the
+    /// game files are not redistributable.
+    ///
+    /// ```text
+    /// PAK_MERGER_UE4_PACKAGE_DIR=<cooked tree>     ///   cargo test --lib data_table_merge -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires a local cooked UE4 package tree"]
+    fn previews_of_a_real_table_read_as_values() {
+        let Ok(root) = std::env::var("PAK_MERGER_UE4_PACKAGE_DIR") else {
+            panic!("set PAK_MERGER_UE4_PACKAGE_DIR to a directory of cooked .uasset files");
+        };
+        let uasset = std::path::Path::new(&root).join("GameText/Database/GameTextEN.uasset");
+        if !uasset.exists() {
+            eprintln!("skipping: {} is not present", uasset.display());
+            return;
+        }
+        let image = DataTableImage::parse(
+            std::fs::read(&uasset).expect("uasset"),
+            std::fs::read(uasset.with_extension("uexp")).expect("uexp"),
+        )
+        .expect("GameTextEN parses");
+
+        let mut shown = 0;
+        let mut distinct = std::collections::BTreeSet::new();
+        for row_index in 0..image.index.rows.len().min(400) {
+            let layout = image.row_layout(row_index).expect("row layout");
+            let Some(text_field) = layout
+                .fields
+                .iter()
+                .find(|field| field.property_type == "TextProperty")
+            else {
+                continue;
+            };
+            let preview = image.unit_preview(&layout, std::slice::from_ref(&text_field.name));
+            distinct.insert(preview.clone());
+            if shown < 5 {
+                println!("  {} -> {preview}", image.index.rows[row_index].name);
+                shown += 1;
+            }
+        }
+        assert!(shown > 0, "no TextProperty rows were found");
+        // The old bug rendered every row identically; distinct values prove the
+        // preview reads the value rather than the tag header.
+        assert!(
+            distinct.len() > 50,
+            "previews are not distinguishing rows: only {} distinct values",
+            distinct.len()
+        );
+        assert!(
+            !distinct
+                .iter()
+                .any(|preview| preview.starts_with("54657874")),
+            "a preview still shows raw tag-header hex"
+        );
+    }
+
+    #[test]
+    fn a_preview_shows_the_value_not_the_tag_header() {
+        // Regression: the preview used to hex-dump the head of the field's
+        // bytes, which is the tag header. Every TextProperty then previewed as
+        // the hex of its own property name, so two Paks with different text
+        // looked identical in the conflict picker.
+        let carrier = image(&base().with_text("Restores 30 HP."));
+        let donor = image(&base().with_text("Restores 60 HP."));
+
+        let carrier_layout = carrier.row_layout(0).unwrap();
+        let donor_layout = donor.row_layout(0).unwrap();
+        let fields = vec!["Detail".to_owned()];
+
+        let carrier_preview = carrier.unit_preview(&carrier_layout, &fields);
+        let donor_preview = donor.unit_preview(&donor_layout, &fields);
+
+        assert_eq!(carrier_preview, "Restores 30 HP.");
+        assert_eq!(donor_preview, "Restores 60 HP.");
+        assert_ne!(carrier_preview, donor_preview);
+
+        // Other property types render as values too, not as byte dumps.
+        assert_eq!(
+            carrier.unit_preview(&carrier_layout, &["Amount".to_owned()]),
+            "1"
+        );
+        assert_eq!(
+            carrier.unit_preview(&carrier_layout, &["Label".to_owned()]),
+            "Alpha"
+        );
+        // A multi-field unit labels each part with the demangled name.
+        assert_eq!(
+            carrier.unit_preview(&carrier_layout, &["Amount".to_owned(), "Label".to_owned()]),
+            "Amount=1, Label=Alpha"
+        );
+    }
+
+    #[test]
+    fn identical_text_is_not_a_conflict_but_different_text_is() {
+        // The semantic digest must key off the value. Same text in both Paks
+        // must compare equal even though each Pak has its own name table.
+        let same_a = image(&base().with_text("Shared line."));
+        let same_b = image(&base().with_text("Shared line."));
+        let different = image(&base().with_text("Changed line."));
+
+        let layout_a = same_a.row_layout(0).unwrap();
+        let layout_b = same_b.row_layout(0).unwrap();
+        let layout_c = different.row_layout(0).unwrap();
+        let fields = vec!["Detail".to_owned()];
+
+        assert_eq!(
+            same_a.unit_semantic_digest(&layout_a, &fields).unwrap(),
+            same_b.unit_semantic_digest(&layout_b, &fields).unwrap()
+        );
+        assert_ne!(
+            same_a.unit_semantic_digest(&layout_a, &fields).unwrap(),
+            different.unit_semantic_digest(&layout_c, &fields).unwrap()
+        );
+    }
+
+    #[test]
+    fn property_names_are_demangled_only_when_they_carry_a_struct_guid() {
+        assert_eq!(
+            demangle_property_name("BGMID_7_B47857404179EE90049AD8A2FCC54983"),
+            "BGMID"
+        );
+        assert_eq!(
+            demangle_property_name("IconL_UV_182_9B6F0DC9467B0EC6E2BF0EA2122480F8"),
+            "IconL_UV"
+        );
+        // Native-struct tables use plain names; they must survive untouched.
+        assert_eq!(demangle_property_name("AbilityRatio"), "AbilityRatio");
+        assert_eq!(demangle_property_name("Detail"), "Detail");
+        // A trailing token that is not a 32-hex GUID is part of the name.
+        assert_eq!(demangle_property_name("Some_7_NOTAGUID"), "Some_7_NOTAGUID");
     }
 
     #[test]

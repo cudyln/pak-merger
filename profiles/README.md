@@ -42,6 +42,14 @@ Each asset rule may contain `fieldGroups` with one of these modes:
 
 Values not listed in a group follow Pak Merger's general rules. Simple top-level values may be selected separately, while arrays and nested values stay together.
 
+## Cross-Table Reference Checks
+
+After a merge, Pak Merger can check that rows which point at rows in another table still find them. This catches a merged Pak that is structurally perfect but broken in game.
+
+These rules are part of the built-in profiles only; schema version 1 has no field for them. A rule is included only when every value of that field, in the shipped game data, is a row of exactly one other table. A rule that is merely usually right would report untouched data as broken, so anything less is left out.
+
+A rule runs only when the merged Pak contains both of its tables. A Pak that ships one side of a reference says nothing about the other, so those rules are skipped and reported as skipped, not as problems.
+
 ## Rust Library API
 
 Load external profiles into a registry, then use the registry-backed analysis

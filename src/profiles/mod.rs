@@ -293,6 +293,27 @@ pub enum ProfileOrigin {
     },
 }
 
+/// A database table this profile can name, identified by the tail of its
+/// virtual path so both rooted and mount-relative Pak paths match.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceTable {
+    pub path_suffix: &'static str,
+    pub name: &'static str,
+}
+
+/// A field whose values must name an existing row of another table.
+///
+/// After a merge, a field pointing at a row that no longer exists is a silent
+/// break: the game reads a dangling id. Checks run only when both tables are
+/// present in the merged Pak, because a Pak that ships one table alone says
+/// nothing about the other.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReferenceRule {
+    pub source_table: &'static str,
+    pub field: &'static str,
+    pub target_table: &'static str,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameProfile {
     pub id: String,
@@ -305,9 +326,23 @@ pub struct GameProfile {
     /// paths whose common `Content` root was removed do not require a match.
     pub root_scope_matchers: Vec<PathMatcher>,
     pub assets: Vec<AssetProfileRule>,
+    /// Tables this profile can resolve by path, for reference checking.
+    pub reference_tables: Vec<ReferenceTable>,
+    /// Cross-table reference rules. An empty list means this profile declares
+    /// no reference knowledge, and post-merge reference checking is skipped.
+    pub reference_rules: Vec<ReferenceRule>,
 }
 
 impl GameProfile {
+    /// Resolves a Pak path to the table name this profile knows it by.
+    pub fn reference_table(&self, asset_path: &str) -> Option<&'static str> {
+        let path = normalize_asset_path(asset_path);
+        self.reference_tables
+            .iter()
+            .find(|table| path.ends_with(table.path_suffix))
+            .map(|table| table.name)
+    }
+
     /// Root prefixes, without the leading `/`, that a Pak entry may carry for
     /// this game. Derived from the declared root scope so no game name is
     /// hardcoded outside the profile.
@@ -1288,6 +1323,8 @@ mod tests {
                     }],
                 },
             }],
+            reference_tables: Vec::new(),
+            reference_rules: Vec::new(),
         };
         let mut registry = ProfileRegistry::empty();
         registry.register(game).unwrap();

@@ -9,6 +9,7 @@ mod enemy;
 mod event;
 mod game_text;
 mod npc;
+mod reference;
 mod skill;
 
 use super::{
@@ -47,6 +48,8 @@ pub(super) fn game_profile() -> GameProfile {
             "/octopath_traveler0/content/",
         )],
         assets,
+        reference_tables: reference::tables(),
+        reference_rules: reference::rules(),
     }
 }
 

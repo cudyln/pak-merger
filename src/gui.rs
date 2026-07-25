@@ -2681,9 +2681,19 @@ fn is_placement_plan_warning(warning: &str) -> bool {
     warning.starts_with("POTENTIAL_PLACEMENT_COLLISION") || warning.starts_with("NpcSet location ")
 }
 
+/// True for lines that describe how the reference check ran rather than
+/// something the user has to act on.
+///
+/// A merged Pak normally holds a handful of tables while a profile declares
+/// rules across all of them, so "some rules did not apply" is the ordinary
+/// outcome, not a warning. Showing it in the review box teaches people to
+/// ignore that box, which is exactly where real broken-reference lines appear.
 fn is_routine_plan_notice(warning: &str) -> bool {
     warning.starts_with("Known-reference validation checked ")
         || warning.starts_with("Only bundled, field-qualified reference rules were checked")
+        || warning.starts_with("No reference rule had both of its tables")
+        || warning.ends_with("only one of their two tables is in the merged Pak.")
+        || warning == pak_merger::merge::NO_REFERENCE_RULES_NOTICE
 }
 
 fn friendly_plan_warning(warning: &str, locale: UiLocale) -> String {
@@ -4349,6 +4359,21 @@ mod tests {
         ));
         assert!(is_routine_plan_notice(
             "Only bundled, field-qualified reference rules were checked"
+        ));
+        // A profile declares rules across the whole game while a mod Pak holds
+        // a few tables, so "the rule did not apply" is the ordinary outcome.
+        assert!(is_routine_plan_notice(
+            "No reference rule had both of its tables in the merged Pak, so none were checked."
+        ));
+        assert!(is_routine_plan_notice(
+            "144 reference rule(s) were skipped because only one of their two tables is in the merged Pak."
+        ));
+        assert!(is_routine_plan_notice(
+            pak_merger::merge::NO_REFERENCE_RULES_NOTICE
+        ));
+        // A real break still has to reach the review box.
+        assert!(!is_routine_plan_notice(
+            "REFERENCE_BREAK: 3 reference(s) point at rows the merged Pak does not contain."
         ));
     }
 
