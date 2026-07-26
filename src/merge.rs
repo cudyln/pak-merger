@@ -5368,6 +5368,14 @@ fn validate_known_references_in_archive(
         target_id: u64,
     }
 
+    #[derive(Default)]
+    struct RuleBreakTally {
+        missing: u64,
+        lowest_id: Option<u64>,
+        highest_id: Option<u64>,
+        examples: Vec<String>,
+    }
+
     // Keep only compact IDs and references. Each complete BinaryAsset tree is
     // dropped before the next table is parsed, so final verification cannot
     // recreate the old all-databases-in-memory peak.
@@ -5487,7 +5495,9 @@ fn validate_known_references_in_archive(
     let mut checked_rules = 0_usize;
     let mut checked_rows = 0_usize;
     let mut missing_count = 0_u64;
-    let mut missing_examples = BTreeSet::new();
+    // Per-rule tallies: a bare total cannot say which link broke or how the
+    // merged target table falls short, which is what makes the report useful.
+    let mut missing_by_rule: BTreeMap<usize, RuleBreakTally> = BTreeMap::new();
     let mut active_rule_indices = BTreeSet::new();
 
     let source_tables: BTreeSet<_> = profile
@@ -5558,14 +5568,14 @@ fn validate_known_references_in_archive(
                 .contains(&(pending.source_row, pending.target_id));
             if !present && !vanilla_gap {
                 missing_count = missing_count.saturating_add(1);
-                if missing_examples.len() < MAX_REFERENCE_BREAK_EXAMPLES {
-                    missing_examples.insert(format!(
-                        "{}.{} row {} -> {} id {}",
-                        rule.source_table,
-                        rule.field,
-                        pending.source_row,
-                        rule.target_table,
-                        pending.target_id
+                let tally = missing_by_rule.entry(pending.rule_index).or_default();
+                tally.missing = tally.missing.saturating_add(1);
+                tally.lowest_id = Some(tally.lowest_id.map_or(pending.target_id, |id: u64| id.min(pending.target_id)));
+                tally.highest_id = Some(tally.highest_id.map_or(pending.target_id, |id: u64| id.max(pending.target_id)));
+                if tally.examples.len() < MAX_REFERENCE_BREAK_EXAMPLES {
+                    tally.examples.push(format!(
+                        "row {} -> {}",
+                        pending.source_row, pending.target_id
                     ));
                 }
             }
@@ -5586,17 +5596,49 @@ fn validate_known_references_in_archive(
 
     progress(total_work_bytes, total_work_bytes, None);
 
+    // A missing row is a genuine in-game break — a mod Pak replaces the whole
+    // asset, so the game does not fall back to the base-game table — but it is a
+    // defect in an input Pak rather than a merge error, and blocking the write
+    // leaves the user with nothing to inspect. Report it in full and continue.
     if missing_count != 0 {
-        let examples = missing_examples.into_iter().collect::<Vec<_>>().join("; ");
-        return Err(MergeError::Verification(format!(
-            "{missing_count} reference(s) point to rows missing from the merged Pak. Examples: {examples}"
-        )));
+        warnings.push(format!(
+            "REFERENCE_BREAK: {missing_count} reference(s) point at rows the merged Pak does not contain."
+        ));
+        for (rule_index, tally) in &missing_by_rule {
+            let rule = &profile.reference_rules[*rule_index];
+            let targets = row_ids
+                .get(rule.target_table)
+                .expect("active reference rule has compact target IDs");
+            let span = match (tally.lowest_id, tally.highest_id) {
+                (Some(low), Some(high)) if low != high => format!("ids {low}-{high}"),
+                (Some(low), Some(_)) => format!("id {low}"),
+                _ => "no ids".to_owned(),
+            };
+            let held = match (targets.first(), targets.last()) {
+                (Some(low), Some(high)) => {
+                    format!("{} row(s), ids {low}-{high}", targets.len())
+                }
+                _ => "no rows".to_owned(),
+            };
+            warnings.push(format!(
+                "REFERENCE_BREAK: {}.{} -> {}: {} missing ({span}). {} in the merged Pak holds {held}. \
+                 A mod Pak replaces the whole table, so the game will not fall back to the base-game \
+                 rows: whichever input supplied {} must carry every row the other tables point at. \
+                 Examples: {}",
+                rule.source_table,
+                rule.field,
+                rule.target_table,
+                tally.missing,
+                rule.target_table,
+                rule.target_table,
+                tally.examples.join("; ")
+            ));
+        }
     }
 
     warnings.push(format!(
         "Reference checks: {checked_rules} rule(s), {checked_rows} row(s)."
     ));
-    warnings.push("Other game-specific links may still need in-game testing.".to_owned());
     warnings.sort();
     warnings.dedup();
     Ok(warnings)
@@ -9733,7 +9775,7 @@ mod tests {
     }
 
     #[test]
-    fn known_reference_validation_blocks_only_when_both_tables_are_embedded() {
+    fn known_reference_validation_reports_breaks_without_blocking_the_merge() {
         let temp = tempfile::tempdir().unwrap();
         let valid = temp.path().join("Valid_P.pak");
         let broken = temp.path().join("Broken_P.pak");
@@ -9764,9 +9806,28 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("Reference checks: 1 rule(s)"))
         );
-        let error = validate_known_references(&broken).unwrap_err();
-        assert!(error.to_string().contains("reference(s) point to rows"));
-        assert!(error.to_string().contains("EnemyID id 8"));
+        assert!(
+            !warnings
+                .iter()
+                .any(|warning| warning.contains("REFERENCE_BREAK"))
+        );
+
+        // A break is the input Pak's defect, not a merge error: the check reports
+        // it and the merge still produces a Pak to inspect.
+        let warnings = validate_known_references(&broken).unwrap();
+        assert!(warnings.iter().any(|warning| {
+            warning.starts_with("REFERENCE_BREAK: 1 reference(s) point at rows")
+        }));
+        let detail = warnings
+            .iter()
+            .find(|warning| warning.contains("-> EnemyID:"))
+            .expect("the break names the rule that failed");
+        // Enough context to act on: which link, how many, which ids are missing,
+        // what the merged target table actually holds, and why it matters.
+        assert!(detail.contains("1 missing (id 8)"), "{detail}");
+        assert!(detail.contains("EnemyID in the merged Pak holds 1 row(s), ids 7-7"), "{detail}");
+        assert!(detail.contains("replaces the whole table"), "{detail}");
+        assert!(detail.contains("row 1 -> 8"), "{detail}");
     }
 
     #[test]

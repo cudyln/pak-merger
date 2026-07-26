@@ -279,7 +279,7 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         "Indexing database" => "データベースを確認",
         "Building and checking the merged Pak…" => "統合 Pak を作成して検査しています…",
         "Cancel" => "キャンセル",
-        "Final data-link check notes" => "最終データリンク確認の注意事項",
+        "Broken data links" => "データリンクの断絶",
         "Cancel operation" => "処理をキャンセル",
         "Cancelling..." => "キャンセルしています…",
         "Category code" => "分類コード",
@@ -2202,17 +2202,24 @@ impl eframe::App for MergerApp {
                                 "Disable the source mod Paks before using the merged Pak.",
                             ),
                         );
-                        if !self.completed_reference_warnings.is_empty() {
+                        // Only actual findings; the check's own book-keeping stays
+                        // in the report. A clean merge shows no box at all.
+                        let reference_findings = self
+                            .completed_reference_warnings
+                            .iter()
+                            .filter(|warning| !is_routine_plan_notice(warning))
+                            .collect::<Vec<_>>();
+                        if !reference_findings.is_empty() {
                             ui.separator();
                             ui.colored_label(
                                 egui::Color32::YELLOW,
                                 egui::RichText::new(self.tr(
-                                    "최종 데이터 연결 검사 참고 사항",
-                                    "Final data-link check notes",
+                                    "데이터 연결이 끊긴 항목",
+                                    "Broken data links",
                                 ))
                                 .strong(),
                             );
-                            for warning in &self.completed_reference_warnings {
+                            for warning in reference_findings {
                                 ui.add(
                                     egui::Label::new(
                                         egui::RichText::new(format!("• {warning}"))
@@ -2754,10 +2761,19 @@ fn is_placement_plan_warning(warning: &str) -> bool {
 /// rules across all of them, so "some rules did not apply" is the ordinary
 /// outcome, not a warning. Showing it in the review box teaches people to
 /// ignore that box, which is exactly where real broken-reference lines appear.
+/// Book-keeping the reference check emits about itself: how much it looked at,
+/// and which rules it could not run because only one of their two tables is in
+/// the Pak. None of it is actionable, and there is a lot of it — a two-Pak merge
+/// routinely skips a rule for every table it does not ship — so it belongs in
+/// the report rather than in a box the user is meant to read. Anything naming an
+/// actual problem, above all `REFERENCE_BREAK`, must fall through.
 fn is_routine_plan_notice(warning: &str) -> bool {
     warning.starts_with("Known-reference validation checked ")
         || warning.starts_with("Only bundled, field-qualified reference rules were checked")
         || warning.starts_with("No reference rule had both of its tables")
+        || warning.starts_with("Reference checks: ")
+        || warning.starts_with("References from ")
+        || warning == "Other game-specific links may still need in-game testing."
         || warning.ends_with("only one of their two tables is in the merged Pak.")
         || warning == pak_merger::merge::NO_REFERENCE_RULES_NOTICE
 }
