@@ -5570,8 +5570,16 @@ fn validate_known_references_in_archive(
                 missing_count = missing_count.saturating_add(1);
                 let tally = missing_by_rule.entry(pending.rule_index).or_default();
                 tally.missing = tally.missing.saturating_add(1);
-                tally.lowest_id = Some(tally.lowest_id.map_or(pending.target_id, |id: u64| id.min(pending.target_id)));
-                tally.highest_id = Some(tally.highest_id.map_or(pending.target_id, |id: u64| id.max(pending.target_id)));
+                tally.lowest_id = Some(
+                    tally
+                        .lowest_id
+                        .map_or(pending.target_id, |id: u64| id.min(pending.target_id)),
+                );
+                tally.highest_id = Some(
+                    tally
+                        .highest_id
+                        .map_or(pending.target_id, |id: u64| id.max(pending.target_id)),
+                );
                 if tally.examples.len() < MAX_REFERENCE_BREAK_EXAMPLES {
                     tally.examples.push(format!(
                         "row {} -> {}",
@@ -9825,7 +9833,10 @@ mod tests {
         // Enough context to act on: which link, how many, which ids are missing,
         // what the merged target table actually holds, and why it matters.
         assert!(detail.contains("1 missing (id 8)"), "{detail}");
-        assert!(detail.contains("EnemyID in the merged Pak holds 1 row(s), ids 7-7"), "{detail}");
+        assert!(
+            detail.contains("EnemyID in the merged Pak holds 1 row(s), ids 7-7"),
+            "{detail}"
+        );
         assert!(detail.contains("replaces the whole table"), "{detail}");
         assert!(detail.contains("row 1 -> 8"), "{detail}");
     }
