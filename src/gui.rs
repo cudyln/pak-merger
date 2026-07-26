@@ -3,9 +3,9 @@ use pak_merger::eula::{self, EulaConfirmations, EulaLocale, PRODUCT_NAME};
 use pak_merger::types::{
     AnalysisRequest, Conflict, ConflictKind, InputDescriptor, MAX_SUPPORTED_PAKS,
     MAX_SUPPORTED_TOTAL_BYTES, MergePlan, MergeProgress, MergeProgressStage, MergeReport,
-    OutputCompression, ResolutionSet, Variant, WriteOptions,
+    OutputCompression, ProfileDetectionStatus, ResolutionSet, Variant, WriteOptions,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -131,6 +131,10 @@ struct PakInspection {
     mount_point: String,
     version: u32,
     entry_count: usize,
+    /// Display name of the game whose profile this Pak's contents match, when
+    /// detection settles on exactly one. `None` when the Pak is unrecognised or
+    /// ambiguous; the UI then shows nothing rather than guessing.
+    detected_game: Option<String>,
     stale_payload_hashes: Vec<StalePayloadHash>,
 }
 
@@ -243,6 +247,7 @@ fn japanese_ui_text(english: &str) -> Option<&'static str> {
         "A file path inside the Pak is not valid, so the Pak cannot be read safely." => {
             "Pak 内のファイルパスが無効なため、安全に読み込めません。"
         }
+        "Game detected from the Pak's contents." => "Pak の内容から検出したゲームです。",
         "A file with that name already exists. Choose a different name." => {
             "同じ名前のファイルが既にあります。別の名前を選択してください。"
         }
@@ -1444,7 +1449,30 @@ impl MergerApp {
     }
 
     fn draw_analyzed_inputs(&self, ui: &mut egui::Ui, plan: &MergePlan) {
-        ui.heading(self.tr("확인한 Pak", "Checked Paks"));
+        // The analysis pins one profile for every input, so the detected game
+        // belongs beside the heading rather than on each card. Nothing is drawn
+        // when the Paks did not resolve to a single known game.
+        let detected_game = plan
+            .selected_profile_id
+            .as_deref()
+            .and_then(|id| pak_merger::profiles::default_registry().game(id))
+            .map(|game| game.display_name.as_str());
+        ui.horizontal_wrapped(|ui| {
+            ui.heading(self.tr("확인한 Pak", "Checked Paks"));
+            if let Some(game) = detected_game {
+                ui.add_space(6.0);
+                ui.label(
+                    egui::RichText::new(game)
+                        .strong()
+                        .color(egui::Color32::from_rgb(226, 232, 240))
+                        .background_color(egui::Color32::from_rgb(43, 70, 92)),
+                )
+                .on_hover_text(self.tr(
+                    "Pak 내용으로 감지한 게임입니다.",
+                    "Game detected from the Pak's contents.",
+                ));
+            }
+        });
         for input in &plan.inputs {
             let version = input
                 .pak_version
@@ -1618,6 +1646,20 @@ impl MergerApp {
             PakInspectionStatus::Supported(inspection) => {
                 ui.horizontal_wrapped(|ui| {
                     ui.colored_label(egui::Color32::LIGHT_GREEN, self.tr("사용 가능", "Ready"));
+                    // Only shown when detection settles on one game; an
+                    // unrecognised Pak gets no badge at all.
+                    if let Some(game) = &inspection.detected_game {
+                        ui.label(
+                            egui::RichText::new(game)
+                                .strong()
+                                .color(egui::Color32::from_rgb(226, 232, 240))
+                                .background_color(egui::Color32::from_rgb(43, 70, 92)),
+                        )
+                        .on_hover_text(self.tr(
+                            "Pak 내용으로 감지한 게임입니다.",
+                            "Game detected from the Pak's contents.",
+                        ));
+                    }
                     ui.label(format!("Pak v{}", inspection.version));
                     ui.label(format!(
                         "{}: {}",
@@ -2391,6 +2433,29 @@ impl eframe::App for MergerApp {
     }
 }
 
+/// Names the game a Pak belongs to, using the same signature matching the
+/// analysis uses to pick a profile. Detection is deliberately conservative — it
+/// yields a name only when exactly one profile qualifies — so an ambiguous or
+/// unknown Pak returns `None` and the UI stays silent instead of guessing.
+fn detect_game_display_name(inventory: &pak_merger::pak::PakInventory) -> Option<String> {
+    let mount = pak_merger::pak::normalize_mount_point(&inventory.mount_point).ok()?;
+    let mount = mount.trim_end_matches('/');
+    let mut paths: BTreeSet<String> = BTreeSet::new();
+    paths.insert(mount.to_owned());
+    for entry in &inventory.entries {
+        paths.insert(format!("{mount}/{}", entry.path.trim_start_matches('/')));
+    }
+    let registry = pak_merger::profiles::default_registry();
+    let detection = registry.detect_inventory(paths.iter().map(String::as_str));
+    if detection.status != ProfileDetectionStatus::Selected {
+        return None;
+    }
+    let selected = detection.selected_profile_id?;
+    registry
+        .game(&selected)
+        .map(|game| game.display_name.clone())
+}
+
 fn inspection_worker() -> (
     Sender<PakInspectionJob>,
     Receiver<PakInspectionMessage>,
@@ -2457,6 +2522,7 @@ fn inspection_worker() -> (
                             mount_point: inventory.mount_point.clone(),
                             version: inventory.footer.version,
                             entry_count: inventory.entries.len(),
+                            detected_game: detect_game_display_name(inventory),
                             stale_payload_hashes,
                         };
                         (inspection, archive)
@@ -4094,6 +4160,7 @@ mod tests {
             mount_point: "../../../Game/Content/".to_owned(),
             version: 11,
             entry_count: 1,
+            detected_game: None,
             stale_payload_hashes: Vec::new(),
         };
 
